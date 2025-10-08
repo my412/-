@@ -28,7 +28,7 @@ print(weather_expanded.shape)
 merged = pd.merge(retail, weather, on='日付', how='left')
 
 
-# ===== エンコーディング対象カラム =====
+# ===== エンコーディング =====
 ad_cols = ['SNS', '売場施策', 'TV放映', 'プロモーション']
 merged[ad_cols] = merged[ad_cols].fillna('なし')
 # One-Hot Encoding（広告関連）
