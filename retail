@@ -1,9 +1,14 @@
+import numpy as np
 import pandas as pd
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, MinMaxScaler
 
 retail = pd.read_excel('C:/Users/23X4002/Desktop/3年生秋/PBL/小売データ.xlsx')
 weather= pd.read_csv('C:/Users/23X4002/Desktop/3年生秋/PBL/気象データ.csv',
                      encoding='cp932', skiprows=3)
 
+
+# ===== データの結合 ======
 weather['日付'] = pd.to_datetime(weather['年月日.1'], errors='coerce')
 weather = weather.loc[:, ~weather.columns.str.contains(r'\.\d+$')]
 weather = weather.drop(columns=['最深積雪(cm)', '平均雲量(10分比)', '年月日'])
@@ -21,6 +26,61 @@ print(weather_expanded.head())
 print(weather_expanded.shape)
 
 merged = pd.merge(retail, weather, on='日付', how='left')
-print(merged.head(20))
 
 
+# ===== エンコーディング対象カラム =====
+ad_cols = ['SNS', '売場施策', 'TV放映', 'プロモーション']
+merged[ad_cols] = merged[ad_cols].fillna('なし')
+# One-Hot Encoding（広告関連）
+ohe = OneHotEncoder(sparse_output=False, drop='first')  # drop='first'でダミー変数落とし
+encoded_ads = pd.DataFrame(
+    ohe.fit_transform(merged[ad_cols]),
+    columns=ohe.get_feature_names_out(ad_cols),
+    index=merged.index
+)
+# エンコード結果を結合し、元の列を削除
+data = pd.concat([merged.drop(columns=ad_cols), encoded_ads], axis=1)
+
+
+
+# ===== 欠損値の処理 =====
+# print(merged.isnull().sum())
+num_cols = merged.select_dtypes(include=[np.number]).columns
+print(num_cols)
+num_imputer = SimpleImputer(strategy='mean')
+merged[num_cols] = num_imputer.fit_transform(data[num_cols])
+# print(merged.isnull().sum())
+
+
+# ===== 外れ値処理（IQR法） =====
+for col in num_cols:
+    Q1 = data[col].quantile(0.25)
+    Q3 = data[col].quantile(0.75)
+    IQR = Q3 - Q1
+    lower = Q1 - 1.5 * IQR
+    upper = Q3 + 1.5 * IQR
+
+    # 外れ値を範囲内に収める（クリッピング）
+    data[col] = np.clip(data[col], lower, upper)
+
+
+# ===== 正規化・標準化 ======
+exclude_cols = ['price', '売上数', '当店在庫手持週']
+scale_cols = [col for col in num_cols if col not in exclude_cols]
+# # --- 標準化（平均0・分散1） ---
+# std_scaler = StandardScaler()
+# merged_std = merged.copy()
+# merged_std[scale_cols] = std_scaler.fit_transform(merged[scale_cols])
+
+# --- MinMax正規化（0〜1） ---
+mm_scaler = MinMaxScaler()
+merged_mm = merged.copy()
+merged_mm[scale_cols] = mm_scaler.fit_transform(merged[scale_cols])
+
+
+
+print(merged_mm.nunique())
+print(merged_mm.shape)
+print(merged_mm.head())
+print(merged_mm.info)
+print(merged_mm.describe())
