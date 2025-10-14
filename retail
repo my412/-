@@ -1,5 +1,9 @@
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import japanize_matplotlib
+from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, MinMaxScaler
 from win32cryptcon import szOID_RSA_data
@@ -29,7 +33,7 @@ print(weather_expanded.shape)
 merged = pd.merge(retail, weather, on='日付', how='left')
 
 
-# ===== エンコーディング対象カラム =====
+# ===== 広告施策に対するエンコーディング =====
 ad_cols = ['SNS', '売場施策', 'TV放映', 'プロモーション']
 merged[ad_cols] = merged[ad_cols].fillna('なし')
 binary_ad_cols = [col + '_有無' for col in ad_cols]
@@ -76,10 +80,57 @@ mm_scaler = MinMaxScaler()
 data_mm = data.copy()
 data_mm[scale_cols] = mm_scaler.fit_transform(data[scale_cols])
 
+# print(data_mm.nunique())
+# print(data_mm.shape)
+# print(data_mm.head())
+# print(data_mm.info())
+# print(data_mm.describe())
 
 
-print(data_mm.nunique())
-print(data_mm.shape)
-print(data_mm.head())
-print(data_mm.info)
-print(data_mm.describe())
+
+
+# ===== 目的変数の設定 ======
+X = data_mm.drop(columns='売上数')
+y = data_mm['売上数']
+
+
+
+# ===== データの分割（疑似的層化分割）=====
+bins = [0, 25, 50, 100, 150, np.inf]
+labels = [0, 1, 2, 3, 4]
+y_bins = pd.cut(y, bins=bins, labels=labels, include_lowest=True)
+split = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+for train_idx, test_idx in split.split(X, y_bins):
+    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+
+
+
+
+# # ===== 可視化 =====
+# # ----- 散布図 -----
+# for col in num_cols:
+#   plt.figure(figsize=(8, 5))
+#   sns.scatterplot(x=col, y="売上数", data=data_mm, alpha=0.5)
+#   plt.xlabel(col)
+#   plt.ylabel("売上数")
+#   plt.title(col+"と売上数")
+#   plt.grid()
+#   plt.show()
+# # ----- ヒストグラム -----
+# plt.figure(figsize=(8, 5))
+# data['売上数'].hist(bins=30)
+# plt.xlabel('売上数')
+# plt.ylabel('件数')
+# plt.title('売上数の分布')
+# plt.show()
+# # ----- testとtrainの分布確認 -----
+# fig, ax = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
+# ax[0].hist(y_train, bins=bins, color='skyblue', edgecolor='black')
+# ax[0].set_title("Train set 売上数分布")
+# ax[1].hist(y_test, bins=bins, color='salmon', edgecolor='black')
+# ax[1].set_title("Test set 売上数分布")
+# plt.show()
+
+
