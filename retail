@@ -3,13 +3,24 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import japanize_matplotlib
+import statsmodels.api as sm
 from sklearn.model_selection import StratifiedShuffleSplit
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, MinMaxScaler
-from win32cryptcon import szOID_RSA_data
+from sklearn.model_selection import KFold, cross_val_score
 
-retail = pd.read_excel('C:/Users/23X4002/Desktop/3年生秋/PBL/小売データ.xlsx')
-weather= pd.read_csv('C:/Users/23X4002/Desktop/3年生秋/PBL/気象データ.csv',
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import make_scorer, mean_squared_error
+
+
+pd.set_option('display.max_columns', None)  # すべての列を表示
+pd.set_option('display.width', None)        # 横幅制限を解除
+
+retail = pd.read_excel('C:/Users/23X4002/Desktop/3年生秋/PBL/需要予測(広告)/小売データ.xlsx')
+weather= pd.read_csv('C:/Users/23X4002/Desktop/3年生秋/PBL/需要予測(広告)/気象データ02.csv',
                      encoding='cp932', skiprows=3)
 
 
@@ -22,36 +33,56 @@ weather = weather.drop(index=[0, 1]).reset_index(drop=True)
 retail['日付'] = pd.to_datetime(retail['day'])
 retail = retail.drop(columns=['day'])
 
-print(retail.head())
-print(weather.head())
-
 # weather を retail の行数に合わせて繰り返す
 weather_expanded = retail[['日付']].merge(weather, on='日付', how='left')
-print(weather_expanded.head())
-print(weather_expanded.shape)
-
 merged = pd.merge(retail, weather, on='日付', how='left')
 
-
-# ===== 広告施策に対するエンコーディング =====
-ad_cols = ['SNS', '売場施策', 'TV放映', 'プロモーション']
-merged[ad_cols] = merged[ad_cols].fillna('なし')
-binary_ad_cols = [col + '_有無' for col in ad_cols]
-# 'なし' でない場合は 1 (あり)、'なし' の場合は 0
-for original_col, new_col in zip(ad_cols, binary_ad_cols):
-    merged[new_col] = (merged[original_col] != 'なし').astype(int)
-# エンコード結果を結合し、元の列を削除
-data = merged.drop(columns=ad_cols)
+merged['月'] = merged['日付'].dt.month
+merged['曜日'] = merged['日付'].dt.dayofweek  # 0=月曜, 6=日曜
+merged['週'] = merged['日付'].dt.isocalendar().week
+merged['年'] = merged['日付'].dt.year
 
 
 
 # ===== 欠損値の処理 =====
-# print(data.isnull().sum())
-num_cols = data.select_dtypes(include=[np.number]).columns
+# print(merged.isnull().sum())
+merged = merged[merged.index != 3]
+beef_mask = (merged['name'] == '焙煎牛肉') & (merged.index >= 16) & (merged.index <= 94)
+for col in ['売上数', '売上高', '店頭在庫数', '納入予定数', '当店在庫手持週']:
+    if col in merged.columns:
+        # 該当範囲の平均値を計算（欠損値を除く）
+        mean_value = merged.loc[beef_mask, col].mean()
+        # 欠損値を平均値で埋める
+        merged.loc[beef_mask, col] = merged.loc[beef_mask, col].fillna(mean_value)
+customer_count_0928 = merged[(merged['日付'] == '2025-09-28')]['客数'].values[0] # 2025/9/28の客数を取得
+merged['客数'] = merged['客数'].fillna(customer_count_0928)                      # 客数の欠損値を2025/9/28の客数で埋める
+num_cols = merged.select_dtypes(include=[np.number]).columns
 print(num_cols)
 num_imputer = SimpleImputer(strategy='mean')
-data[num_cols] = num_imputer.fit_transform(data[num_cols])
-# print(data.isnull().sum())
+merged[num_cols] = num_imputer.fit_transform(merged[num_cols])
+# print(merged.isnull().sum())
+
+
+# ===== 広告施策に対する統合エンコーディング =====
+# ad_cols = ['SNS', '売場施策', 'TV放映', 'プロモーション']
+# # 欠損を「なし」で埋める
+# merged[ad_cols] = merged[ad_cols].fillna('なし')
+# # 各広告列を「あり＝1, なし＝0」でバイナリ化
+# for col in ad_cols:
+#     merged[col + '_有無'] = (merged[col] != 'なし').astype(int)
+# # ---- すべての広告を統合 ----
+# # 少なくとも1つでも「あり」なら広告あり（1）
+# merged['広告_有無'] = merged[[col + '_有無' for col in ad_cols]].max(axis=1)
+# # 元の広告列と個別の有無列を削除
+# data = merged.drop(columns=ad_cols + [col + '_有無' for col in ad_cols])
+# print(data['広告_有無'].value_counts())
+
+ad_cols = ['SNS', '売場施策', 'TV放映', 'プロモーション']
+merged[ad_cols] = merged[ad_cols].fillna('なし')
+binary_ad_cols = [col + '_有無' for col in ad_cols]
+for original_col, new_col in zip(ad_cols, binary_ad_cols):
+    merged[new_col] = (merged[original_col] != 'なし').astype(int)
+data = merged.drop(columns=ad_cols)
 
 
 
@@ -67,42 +98,176 @@ for col in num_cols:
     data[col] = np.clip(data[col], lower, upper)
 
 
-# ===== 正規化・標準化 ======
+# ===== 正規化 ======
 exclude_cols = ['price', '売上数', '当店在庫手持週',
                 'SNS_有無', '売場施策_有無', 'TV放映_有無', 'プロモーション_有無']
 scale_cols = [col for col in num_cols if col not in exclude_cols]
-# # --- 標準化（平均0・分散1） ---
-# std_scaler = StandardScaler()
-# data_std = data.copy()
-# data_std[scale_cols] = std_scaler.fit_transform(data[scale_cols])
 # --- MinMax正規化（0〜1） ---
 mm_scaler = MinMaxScaler()
 data_mm = data.copy()
 data_mm[scale_cols] = mm_scaler.fit_transform(data[scale_cols])
 
-# print(data_mm.nunique())
-# print(data_mm.shape)
-# print(data_mm.head())
-# print(data_mm.info())
-# print(data_mm.describe())
-
-
-
 
 # ===== 目的変数の設定 ======
-X = data_mm.drop(columns='売上数')
-y = data_mm['売上数']
+X_mm = data_mm.drop(columns=['売上数', '日付', '売上高'])
+y_mm = data_mm['売上数']
 
+X_mm = pd.get_dummies(X_mm, drop_first=True)
+X_mm = X_mm.apply(pd.to_numeric, errors="coerce")
+y_mm = y_mm.loc[X_mm.index]  # インデックスを揃える
+X_mm = sm.add_constant(X_mm)
+X_mm = X_mm.astype(float)
 
 
 # ===== データの分割（疑似的層化分割）=====
 bins = [0, 25, 50, 100, 150, np.inf]
 labels = [0, 1, 2, 3, 4]
-y_bins = pd.cut(y, bins=bins, labels=labels, include_lowest=True)
+y_mm_bins = pd.cut(y_mm, bins=bins, labels=labels, include_lowest=True)
 split = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-for train_idx, test_idx in split.split(X, y_bins):
-    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+for train_idx, test_idx in split.split(X_mm, y_mm_bins):
+    X_train, X_test = X_mm.iloc[train_idx], X_mm.iloc[test_idx]
+    y_train, y_test = y_mm.iloc[train_idx], y_mm.iloc[test_idx]
+
+print(data_mm.nunique())
+print(data_mm.shape)
+print(data_mm.head())
+print(data_mm.info())
+print(data_mm.describe())
+
+
+
+# ---- ステップワイズ回帰（AIC基準） ----
+def stepwise_selection(X_mm, y_mm,
+                       initial_list=[],
+                       always_include=None,  # ← 強制的に含めたい特徴量
+                       threshold_in=0.01,
+                       threshold_out=0.05,
+                       verbose=True):
+    if always_include is None:
+        always_include = []
+
+    included = list(initial_list) + list(always_include)
+    included = list(dict.fromkeys(included))  # 重複除去
+
+    while True:
+        changed = False
+
+        # ----- forward step -----
+        excluded = list(set(X_mm.columns) - set(included))
+        new_pval = pd.Series(index=excluded, dtype=float)
+
+        for new_column in excluded:
+            try:
+                model = sm.OLS(y_mm, sm.add_constant(pd.DataFrame(X_mm[included + [new_column]]))).fit()
+                new_pval[new_column] = model.pvalues[new_column]
+            except Exception as e:
+                continue  # 型エラーや共線性のエラーをスキップ
+
+        best_pval = new_pval.min() if not new_pval.empty else None
+        if best_pval is not None and best_pval < threshold_in:
+            best_feature = new_pval.idxmin()
+            included.append(best_feature)
+            changed = True
+            if verbose:
+                print(f"追加: {best_feature} (p={best_pval:.6f})")
+
+        # ----- backward step -----
+        model = sm.OLS(y_mm, sm.add_constant(pd.DataFrame(X_mm[included]))).fit()
+        pvalues = model.pvalues.iloc[1:]  # 定数項を除外
+        worst_pval = pvalues.max() if not pvalues.empty else None
+        if worst_pval is not None and worst_pval > threshold_out:
+            worst_feature = pvalues.idxmax()
+            # 強制的に残す特徴量は削除しない
+            if worst_feature not in always_include:
+                included.remove(worst_feature)
+                changed = True
+                if verbose:
+                    print(f"削除: {worst_feature} (p={worst_pval:.6f})")
+
+        if not changed:
+            break
+
+    return included
+
+
+# ---- 常に含めたい特徴量 ----
+fixed_features = ['SNS_有無', '売場施策_有無', 'TV放映_有無']
+
+# ---- 実行 ----
+selected_features = stepwise_selection(X_mm, y_mm, always_include=fixed_features, verbose=True)
+print("\n✅ 最終的に選ばれた特徴量:")
+print(selected_features)
+
+# ---- 最終モデル ----
+final_model = sm.OLS(y_mm, sm.add_constant(X_mm[selected_features])).fit()
+print(final_model.summary())
+
+
+
+# =================================================================================================
+
+# # ===== 標準化 =====
+# std_scaler = StandardScaler()
+# data_std = data.copy()
+# data_std[scale_cols] = std_scaler.fit_transform(data[scale_cols])
+
+# ===== 目的変数の設定 ======
+X_std = data.drop(columns=['売上数', '日付', '売上高'])
+y_std = data['売上数']
+
+X_std = pd.get_dummies(X_std, drop_first=True)
+X_std = X_std.apply(pd.to_numeric, errors="coerce")
+y_std = y_std.loc[X_std.index]  # インデックスを揃える
+X_std = X_std.astype(float)
+
+
+# SVRはスケーリング必須なので標準化
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X_std)
+
+# ===== 交差検証用設定 =====
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+
+
+# ===== 評価指標 =====
+def rmse(y_true, y_pred):
+    return np.sqrt(mean_squared_error(y_true, y_pred))
+
+
+rmse_scorer = make_scorer(rmse, greater_is_better=False)  # scikit-learnは最大化するスコアなので負にする
+
+# ===== モデル候補 =====
+models = {
+    "SVR": SVR(kernel='rbf'),
+    "DecisionTree": DecisionTreeRegressor(random_state=42),
+    "RandomForest": RandomForestRegressor(n_estimators=100, random_state=42)
+}
+
+results = {}
+
+# ===== 交差検証 =====
+for name, model in models.items():
+    if name == "SVR":
+        X_input = X_scaled
+    else:
+        X_input = X_std
+
+    scores_r2 = cross_val_score(model, X_input, y_std, cv=kf, scoring='r2')
+    scores_rmse = cross_val_score(model, X_input, y_std, cv=kf, scoring=rmse_scorer)
+
+    results[name] = {
+        "R2_mean": np.mean(scores_r2),
+        "R2_std": np.std(scores_r2),
+        "RMSE_mean": -np.mean(scores_rmse),  # 負符号を戻す
+        "RMSE_std": np.std(scores_rmse)
+    }
+
+# ===== 結果表示 =====
+results_df = pd.DataFrame(results).T
+print(results_df)
+
+
+
 
 
 
@@ -131,6 +296,38 @@ for train_idx, test_idx in split.split(X, y_bins):
 # ax[0].set_title("Train set 売上数分布")
 # ax[1].hist(y_test, bins=bins, color='salmon', edgecolor='black')
 # ax[1].set_title("Test set 売上数分布")
+# plt.show()
+# ----- 箱ひげ図 -----
+# plt.figure(figsize=(12, 12))
+# sns.boxplot(x="name", y="売上数", data=data_mm, order=["バターチキン", "グリーン", "牛バラ", "焙煎牛肉", "ハンバーグのデミグラスソースカレー",
+#                                                        "サグチキン", "プラウンマサラ", "キーマカレー", "トマトのキーマカレー", "欧風ビーフカレー",
+#                                                        "牛すじカレー", "ほたてと海老のビスクカレー", "ゴロゴロ野菜とひき肉のカレー"])
+# plt.xlabel("商品名")
+# plt.ylabel("売上数")
+# plt.title("商品名ごとの売上数分布")
+# plt.grid()
+# plt.show()
+# # ----- 1. 相関行列（売上数と売上高） -----
+# corr_matrix = data_mm.select_dtypes(include=['int64', 'float64']).corr()
+# plt.figure(figsize=(15, 7))
+# # 左: 相関ヒートマップ
+# plt.subplot(1, 2, 1)
+# sns.heatmap(corr_matrix, annot=True, cmap="coolwarm", fmt=".2f", square=True)
+# plt.title("相関のヒートマップ")
+# # ----- 2. VIF計算 -----
+# # Xに定数項がある場合は除く
+# X_vif = X_mm.drop(columns='const', errors='ignore')
+# vif_data = pd.DataFrame()
+# vif_data["feature"] = X_vif.columns
+# vif_data["VIF"] = [variance_inflation_factor(X_vif.values, i) for i in range(X_vif.shape[1])]
+# # VIFを高い順にソートして棒グラフ表示
+# plt.subplot(1, 2, 2)
+# vif_sorted = vif_data.sort_values(by='VIF', ascending=False).head(10)  # 上位10個だけ表示
+# sns.barplot(x='VIF', y='feature', data=vif_sorted, palette='viridis')
+# plt.axvline(10, color='red', linestyle='--', label='VIF=10')
+# plt.title("説明変数のVIF（上位10）")
+# plt.legend()
+# plt.tight_layout()
 # plt.show()
 
 
