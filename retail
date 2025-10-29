@@ -24,6 +24,11 @@ weather= pd.read_csv('C:/Users/23X4002/Desktop/3年生秋/PBL/需要予測(広�
                      encoding='cp932', skiprows=3)
 
 
+
+
+
+
+
 # ===== データの結合 ======
 weather['日付'] = pd.to_datetime(weather['年月日.1'], errors='coerce')
 weather = weather.loc[:, ~weather.columns.str.contains(r'\.\d+$')]
@@ -37,10 +42,10 @@ retail = retail.drop(columns=['day'])
 weather_expanded = retail[['日付']].merge(weather, on='日付', how='left')
 merged = pd.merge(retail, weather, on='日付', how='left')
 
-merged['月'] = merged['日付'].dt.month
-merged['曜日'] = merged['日付'].dt.dayofweek  # 0=月曜, 6=日曜
-merged['週'] = merged['日付'].dt.isocalendar().week
-merged['年'] = merged['日付'].dt.year
+
+
+
+
 
 
 
@@ -63,39 +68,85 @@ merged[num_cols] = num_imputer.fit_transform(merged[num_cols])
 # print(merged.isnull().sum())
 
 
+
+
+
+
+
+
+# ===== 外れ値処理（IQR法） =====
+for col in num_cols:
+    Q1 = merged[col].quantile(0.25)
+    Q3 = merged[col].quantile(0.75)
+    IQR = Q3 - Q1
+    lower = Q1 - 1.5 * IQR
+    upper = Q3 + 1.5 * IQR
+
+    # 外れ値を範囲内に収める（クリッピング）
+    merged[col] = np.clip(merged[col], lower, upper)
+
+
+
+
+
+
+
+
+
+
 # ===== 広告施策に対する統合エンコーディング =====
+# # ---- すべての広告を統合 ----
 # ad_cols = ['SNS', '売場施策', 'TV放映', 'プロモーション']
 # # 欠損を「なし」で埋める
 # merged[ad_cols] = merged[ad_cols].fillna('なし')
 # # 各広告列を「あり＝1, なし＝0」でバイナリ化
 # for col in ad_cols:
 #     merged[col + '_有無'] = (merged[col] != 'なし').astype(int)
-# # ---- すべての広告を統合 ----
 # # 少なくとも1つでも「あり」なら広告あり（1）
 # merged['広告_有無'] = merged[[col + '_有無' for col in ad_cols]].max(axis=1)
 # # 元の広告列と個別の有無列を削除
 # data = merged.drop(columns=ad_cols + [col + '_有無' for col in ad_cols])
 # print(data['広告_有無'].value_counts())
 
+# ----- 各広告ごとダミー変数化 -----
 ad_cols = ['SNS', '売場施策', 'TV放映', 'プロモーション']
 merged[ad_cols] = merged[ad_cols].fillna('なし')
 binary_ad_cols = [col + '_有無' for col in ad_cols]
 for original_col, new_col in zip(ad_cols, binary_ad_cols):
-    merged[new_col] = (merged[original_col] != 'なし').astype(int)
+    merged[new_col] = (
+        merged[original_col].notna() &
+        (merged[original_col].astype(str).str.strip() != '') &
+        (merged[original_col].astype(str).str.strip() != 'なし') &
+        (merged[original_col].astype(str).str.lower() != 'nan')
+    ).astype(int)
 data = merged.drop(columns=ad_cols)
 
 
 
-# ===== 外れ値処理（IQR法） =====
-for col in num_cols:
-    Q1 = data[col].quantile(0.25)
-    Q3 = data[col].quantile(0.75)
-    IQR = Q3 - Q1
-    lower = Q1 - 1.5 * IQR
-    upper = Q3 + 1.5 * IQR
 
-    # 外れ値を範囲内に収める（クリッピング）
-    data[col] = np.clip(data[col], lower, upper)
+
+
+
+
+# ===== 時系列特徴量・ラグ・移動平均 =====
+data['月'] = data['日付'].dt.month
+data['週'] = data['日付'].dt.isocalendar().week
+data['年'] = data['日付'].dt.year
+lags = (1, 2, 3, 7)
+for lag in lags:
+        data[f'売上数_lag{lag}'] = data["売上数"].shift(lag)
+rolling_windows = (3, 7)
+for w in rolling_windows:
+        data[f'売上数_rollmean_{w}'] = data['売上数'].shift(1).rolling(window=w, min_periods=1).mean()
+data.bfill(inplace=True)
+data.fillna(0, inplace=True)
+# print(data.head(-1))
+
+
+
+
+
+
 
 
 # ===== 正規化 ======
@@ -106,6 +157,24 @@ scale_cols = [col for col in num_cols if col not in exclude_cols]
 mm_scaler = MinMaxScaler()
 data_mm = data.copy()
 data_mm[scale_cols] = mm_scaler.fit_transform(data[scale_cols])
+
+
+# print(data_mm.nunique())
+# print(data_mm.shape)
+# print(data_mm.head())
+# print(data_mm.info())
+# print(data_mm.describe())
+
+
+
+# 広告あり・なしでデータを分割
+data_ad = merged[(merged['SNS_有無'] == 1)|(merged['売場施策_有無'] == 1)|(merged['TV放映_有無'] == 1)].copy()   # 広告あり
+data_noad = merged[(merged['SNS_有無'] == 0)&(merged['売場施策_有無'] == 0)&(merged['TV放映_有無'] == 0)].copy() # 広告なし
+
+print(data_ad.shape, data_noad.shape)
+
+
+
 
 
 # ===== 目的変数の設定 ======
@@ -119,6 +188,12 @@ X_mm = sm.add_constant(X_mm)
 X_mm = X_mm.astype(float)
 
 
+
+
+
+
+
+
 # ===== データの分割（疑似的層化分割）=====
 bins = [0, 25, 50, 100, 150, np.inf]
 labels = [0, 1, 2, 3, 4]
@@ -127,12 +202,13 @@ split = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
 for train_idx, test_idx in split.split(X_mm, y_mm_bins):
     X_train, X_test = X_mm.iloc[train_idx], X_mm.iloc[test_idx]
     y_train, y_test = y_mm.iloc[train_idx], y_mm.iloc[test_idx]
+# ↑↑この分割方法だと時系列的要素を損失しているため改善すべき
+#   広告の有無に偏りが出ると思い、疑似的そうか分割を使用
 
-print(data_mm.nunique())
-print(data_mm.shape)
-print(data_mm.head())
-print(data_mm.info())
-print(data_mm.describe())
+# print(X_train.shape, X_test.shape)
+# print(y_train.shape, y_test.shape)
+
+
 
 
 
@@ -212,18 +288,23 @@ print(final_model.summary())
 # data_std[scale_cols] = std_scaler.fit_transform(data[scale_cols])
 
 # ===== 目的変数の設定 ======
-X_std = data.drop(columns=['売上数', '日付', '売上高'])
-y_std = data['売上数']
-
-X_std = pd.get_dummies(X_std, drop_first=True)
-X_std = X_std.apply(pd.to_numeric, errors="coerce")
-y_std = y_std.loc[X_std.index]  # インデックスを揃える
-X_std = X_std.astype(float)
+X = data.drop(columns=['売上数', '日付', '売上高'])
+y = data['売上数']
 
 
-# SVRはスケーリング必須なので標準化
+
+# nameなどのカテゴリ変数をダミー変数化
+X = pd.get_dummies(X, drop_first=True)
+
+
+
+
+# スケーリング:標準化
 scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X_std)
+X_std = scaler.fit_transform(X)
+
+
+
 
 # ===== 交差検証用設定 =====
 kf = KFold(n_splits=5, shuffle=True, random_state=42)
@@ -247,13 +328,10 @@ results = {}
 
 # ===== 交差検証 =====
 for name, model in models.items():
-    if name == "SVR":
-        X_input = X_scaled
-    else:
-        X_input = X_std
+    X_input = X_std
 
-    scores_r2 = cross_val_score(model, X_input, y_std, cv=kf, scoring='r2')
-    scores_rmse = cross_val_score(model, X_input, y_std, cv=kf, scoring=rmse_scorer)
+    scores_r2 = cross_val_score(model, X_input, y, cv=kf, scoring='r2')
+    scores_rmse = cross_val_score(model, X_input, y, cv=kf, scoring=rmse_scorer)
 
     results[name] = {
         "R2_mean": np.mean(scores_r2),
