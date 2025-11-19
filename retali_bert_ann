@@ -1,0 +1,377 @@
+from transformers import BertTokenizer, BertModel
+import torch
+import torch.nn as nn
+from collections import OrderedDict
+import numpy as np
+import pandas as pd
+from matplotlib import pyplot as plt
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import MinMaxScaler
+
+
+# ---- モデル読み込み（中間層を返す設定） ----
+tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+model = BertModel.from_pretrained("bert-base-uncased", output_hidden_states=True)
+
+def bert_features(text, layer=8):
+    # テキスト → Tensor
+    tokens = tokenizer(text, return_tensors='pt', truncation=True, max_length=128)
+
+    with torch.no_grad():
+        outputs = model(**tokens)
+
+    hidden_states = outputs.hidden_states  # 全層 (13個)
+
+    # ---- 使いたい層を選択 ----
+    h = hidden_states[layer]  # shape: (1, seq_len, 768)
+
+    # ---- CLSベクトルを特徴量にする ----
+    cls_vec = h[:, 0, :].squeeze().numpy()  # shape: (768,)
+
+    return cls_vec
+
+
+def bert_features_batch(text_list, layer=8, batch_size=16):
+
+    all_vecs = []
+
+    for i in range(0, len(text_list), batch_size):
+        batch_texts = text_list[i:i+batch_size]
+
+        # まとめてトークナイズ（padding あり）
+        tokens = tokenizer(batch_texts,
+                           return_tensors='pt',
+                           truncation=True,
+                           padding=True,
+                           max_length=128)
+
+        with torch.no_grad():
+            outputs = model(**tokens)
+
+        hidden_states = outputs.hidden_states
+        h = hidden_states[layer]       # shape: (B, seq_len, 768)
+        mask = tokens["attention_mask"].unsqueeze(-1)
+
+        # mean pooling
+        h_masked = h * mask
+        sum_vec = h_masked.sum(dim=1)
+        len_tokens = mask.sum(dim=1)
+        mean_vec = sum_vec / len_tokens  # shape: (B, 768)
+
+        # numpy に変換
+        all_vecs.append(mean_vec.numpy())
+
+    # 全バッチを結合
+    return np.vstack(all_vecs)
+
+
+
+
+
+# --- ヘルパー: numpy -> torch tensor 変換 ---
+def to_tensor_Xy(X_np, y_np):
+    X_t = torch.from_numpy(X_np.astype(np.float32))
+    y_t = torch.from_numpy(y_np.astype(np.float32)).reshape(-1, 1)
+    return X_t, y_t
+
+
+
+
+
+# ===== ANNの関数 =====
+def training_loop_ann(n_epochs, optimizer, scheduler, model, loss_fn, X_train, X_test, y_train, y_test):
+    train_losses = []
+    val_losses = []
+    for epoch in range(1, n_epochs + 1):
+        model.train()
+        y_p_train = model(X_train)
+        loss_train = loss_fn(y_p_train, y_train)
+
+        model.eval()
+        with torch.no_grad():
+            y_p_test = model(X_test)
+            loss_test = loss_fn(y_p_test, y_test)
+
+        optimizer.zero_grad()
+        loss_train.backward()
+        optimizer.step()
+        scheduler.step()
+
+        train_losses.append(loss_train.item())
+        val_losses.append(loss_test.item())
+
+        if epoch == 1 or epoch % 1000 == 0:
+            print(f"Epoch {epoch:5d} | Training loss {loss_train.item():.4f} | Validation loss {loss_test.item():.4f}")
+
+    return train_losses, val_losses
+
+
+def train_model_ann(X_train, X_val, y_train, y_val, input_size, title):
+    model = nn.Sequential(OrderedDict([
+        ('hidden1', nn.Linear(input_size, 50)),
+        ('act1', nn.ReLU()),
+        ('hidden2', nn.Linear(50, 25)),
+        ('act2', nn.ReLU()),
+        ('output', nn.Linear(25, 1))
+    ]))
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.9)
+    loss_fn = nn.MSELoss()
+
+    train_losses, val_losses = training_loop_ann(
+        n_epochs=5000,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        model=model,
+        loss_fn=loss_fn,
+        X_train=X_train,
+        X_test=X_val,
+        y_train=y_train,
+        y_test=y_val
+    )
+
+    # ----- 学習曲線プロット -----
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.title(f'{title} - Training & Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('MSE Loss')
+    plt.legend()
+    plt.show()
+
+    return model
+
+
+def evaluate_model_ann(model, X_val, y_val, title, sales_max, sales_min):
+    model.eval()
+    with torch.no_grad():
+        y_pred = model(X_val).squeeze().numpy()
+        y_true = y_val.squeeze().numpy()
+
+
+    y_true_orig = y_true * (sales_max - sales_min) + sales_min
+    y_pred_orig = y_pred * (sales_max - sales_min) + sales_min
+    mse = mean_squared_error(y_true_orig, y_pred_orig)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true_orig, y_pred_orig)
+    r2 = r2_score(y_true_orig, y_pred_orig)
+    ''' # 評価指数を元のスケールに戻す
+
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    '''
+
+    print(f"\n=== {title} の評価結果 ===")
+    print(f"RMSE（平均二乗誤差の平方根）: {rmse:.4f}")
+    print(f"MAE（平均絶対誤差）: {mae:.4f}")
+    print(f"R²（決定係数）: {r2:.4f}\n")
+
+    # === 2. 予測値 vs 実測値 ===
+    plt.figure(figsize=(6, 6))
+    plt.scatter(y_true, y_pred, alpha=0.6)
+    min_val, max_val = min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())
+    plt.plot([min_val, max_val], [min_val, max_val], color='red', linestyle='--', label='y=x')
+    plt.title(f'{title}：予測値 vs 実測値')
+    plt.xlabel('Actual')
+    plt.ylabel('Predicted')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    return rmse, mae, r2
+
+# --- ANN を TimeSeriesSplit で CV 実行 ---
+def run_ann_cv(X, y, tscv, verbose=True):
+    rmse_list, mae_list, r2_list = [], [], []
+    input_size = X.shape[1]
+
+    for fold, (train_idx, test_idx) in enumerate(tscv.split(X), 1):
+        X_train_np, X_test_np = X[train_idx], X[test_idx]
+        y_train_np, y_test_np = y[train_idx], y[test_idx]
+
+        # torch テンソル化
+        X_train_t, y_train_t = to_tensor_Xy(X_train_np, y_train_np)
+        X_val_t, y_val_t = to_tensor_Xy(X_test_np, y_test_np)
+
+        # 学習（train_model_ann を利用）
+        title = f"ANN Fold {fold}"
+        model_ann = train_model_ann(X_train_t, X_val_t, y_train_t, y_val_t, input_size=input_size, title=title)
+
+        # 評価（y_scaler の min/max を渡す）
+        sales_max = y_scaler.data_max_[0]
+        sales_min = y_scaler.data_min_[0]
+        rmse, mae, r2 = evaluate_model_ann(model_ann, X_val_t, y_val_t, title, sales_max, sales_min)
+        rmse_list.append(rmse); mae_list.append(mae); r2_list.append(r2)
+
+        if verbose:
+            print(f"[ANN] Fold {fold} -> RMSE: {rmse:.4f}, MAE: {mae:.4f}, R2: {r2:.4f}")
+
+    print("\n=== ANN CV 結果 ===")
+    print(f"平均 RMSE: {np.mean(rmse_list):.4f} (std {np.std(rmse_list):.4f})")
+    print(f"平均 MAE : {np.mean(mae_list):.4f}")
+    print(f"平均 R2  : {np.mean(r2_list):.4f}")
+    return rmse_list, mae_list, r2_list
+
+
+
+
+
+pd.set_option('display.max_columns', None)  # すべての列を表示
+pd.set_option('display.width', None)        # 横幅制限を解除
+
+
+retail = pd.read_excel('C:/Users/23X4002/Desktop/3年生秋/PBL/需要予測(広告)/小売データ.xlsx')
+weather= pd.read_csv('C:/Users/23X4002/Desktop/3年生秋/PBL/需要予測(広告)/気象データ03.csv',
+                     encoding='cp932', skiprows=3)
+
+
+
+
+
+# ===== データの結合　 =====
+weather['日付'] = pd.to_datetime(weather['年月日.1'], errors='coerce')
+weather = weather.loc[:, ~weather.columns.str.contains(r'\.\d+$')]
+weather = weather.drop(columns=['最深積雪(cm)', '平均雲量(10分比)', '年月日'])
+weather = weather.drop(index=[0, 1]).reset_index(drop=True)
+
+retail['日付'] = pd.to_datetime(retail['day'])
+retail = retail.drop(columns=['day'])
+
+merged = pd.merge(retail, weather, on = '日付', how = 'left')
+
+
+
+
+
+# ===== 広告施策に対するエンコーディング =====
+# ---- すべての広告を統合 ----
+ad_cols = ['SNS', '売場施策', 'TV放映', 'プロモーション']
+merged[ad_cols] = merged[ad_cols].fillna(0)
+# 各広告列を「あり＝1, なし＝0」でバイナリ化
+for col in ad_cols:
+    merged[col + '_有無'] = (merged[col] != 0).astype(int)
+merged['広告_有無'] = merged[[col + '_有無' for col in ad_cols]].max(axis=1)
+data = merged.drop(columns=ad_cols + [col + '_有無' for col in ad_cols])
+# print(data['広告_有無'].value_counts())
+
+
+
+
+
+# ===== ラグ・移動平均 =====
+data['広告_有無_lag2'] = (
+        data.groupby('name')['広告_有無'].shift(2)
+    )
+data['広告_有無_lag2'] = data[f'広告_有無_lag2'].fillna(0)
+data['売上数_rollmean_prev3'] = (
+    data.groupby('name')['売上数']
+        .apply(lambda s: s.shift(1).rolling(window=3, min_periods=1).mean())
+        .reset_index(level=0, drop=True)
+)
+data['売上数_rollmean_prev3'] = data['売上数_rollmean_prev3'].fillna(0)
+# print(data.head(30))
+
+
+
+
+
+# ===== 欠損値の処理 =====
+# print(merged.isnull().sum())
+data = data[data.index != 3]
+beef_mask = (data['name'] == '焙煎牛肉') & (data.index >= 16) & (data.index <= 94)
+for col in ['売上数', '売上高', '店頭在庫数', '納入予定数', '当店在庫手持週']:
+    if col in data.columns:
+        mean_value = data.loc[beef_mask, col].mean()
+        data.loc[beef_mask, col] = data.loc[beef_mask, col].fillna(mean_value)
+costomer_count_250928 = data[(data['日付'] == '2025-09-28')]['客数'].values[0]
+data['客数'] = data['客数'].fillna(costomer_count_250928)
+num_cols = ['price', '客数', '売上数', '売上高', '店頭在庫数', '納入予定数', '当店在庫手持週',
+            '平均気温(℃)', '降水量の合計(mm)', '日照時間(時間)', '平均風速(m/s)', '平均蒸気圧(hPa)']
+# print(num_cols)
+num_imputer = SimpleImputer(strategy='mean')
+data[num_cols] = num_imputer.fit_transform(data[num_cols])
+# print(merged.isnull().sum())
+
+
+
+
+
+# ===== 外れ値の処理 =====
+for col in num_cols:
+    Q1 = data[col].quantile(0.25)
+    Q3 = data[col].quantile(0.75)
+    IQR = Q3 - Q1
+    lower = Q1 - 1.5 * IQR
+    upper = Q3 + 1.5 * IQR
+    data[col] = np.clip(data[col], lower, upper)
+
+
+
+
+
+# ===== 時系列特徴量 =====
+data['yday'] = data['日付'].dt.dayofyear
+data['yday_sin'] = np.sin(2 * np.pi * data['yday'] / 365)
+data['yday_cos'] = np.cos(2 * np.pi * data['yday'] / 365)
+data = data.drop(columns=['yday'])
+
+
+
+
+
+# ===== nameの特徴量作成 =====
+data_api = data.copy()
+# data_api["bert_vec"] = data_api["name"].apply(bert_features)
+data_api["bert_vec"] = list(bert_features_batch(data_api["name"].tolist(), layer=8))
+
+
+
+
+
+
+# ===== 正規化 =====
+scale_cols = ['price', '客数', '店頭在庫数', '納入予定数', '当店在庫手持週',
+              '平均気温(℃)', '降水量の合計(mm)', '日照時間(時間)', '平均風速(m/s)', '平均蒸気圧(hPa)', '売上数_rollmean_prev3']
+mm_scaler = MinMaxScaler()
+data_mm = data_api.copy()
+data_mm[scale_cols] = mm_scaler.fit_transform(data[scale_cols])
+
+y_scaler = MinMaxScaler()
+y_scaled = y_scaler.fit_transform(data[['売上数']])
+data_mm['売上数'] = y_scaled
+print(data_mm.head(-1))
+print(data_mm.describe())
+print(data_mm.info())
+
+
+
+
+
+# ===== 特徴量の選択 =====
+# select_cols = ['客数', '売上数_rollmean_prev3', '店頭在庫数', '当店在庫手持週', 'name_【2辛】素材を生かしたカレー 6代目バターチキン',
+#                'name_【3辛】焙煎スパイスのごろり牛肉カレー', '日照時間(時間)', 'name_【4辛】素材を生かした牛ばら肉の大盛カレー', '降水量の合計(mm)', 'name_【5辛】素材を生かしたカレー グリーン',
+#                'yday_sin', '平均気温(℃)', '平均風速(m/s)', '納入予定数', 'yday_cos',
+#                '広告_有無_lag2']
+exclude_cols = ['name', '売上数', '売上高','日付', '広告_有無', "bert_vec"]
+target = '売上数'
+X_bert = np.vstack(data_mm["bert_vec"].values)  # shape: (n_samples, 768)
+X_num = data_mm.drop(columns=exclude_cols).values  # 数値特徴量
+X = np.hstack([X_num, X_bert])
+# X = data_mm[select_cols]
+y = data_mm[target].values
+print(X.shape, y.shape)
+
+
+
+
+
+# ===== ANNの実装 =====
+tscv = TimeSeriesSplit(n_splits=5)
+print("Start ANN CV ...")
+ann_rmse, ann_mae, ann_r2 = run_ann_cv(X, y, tscv=tscv)
