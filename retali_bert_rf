@@ -1,0 +1,276 @@
+from transformers import BertTokenizer, BertModel
+import torch
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.impute import SimpleImputer
+
+
+
+# ---- モデル読み込み（中間層を返す設定） ----
+tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+model = BertModel.from_pretrained("bert-base-uncased", output_hidden_states=True)
+
+def bert_features(text, layer=8):
+    # テキスト → Tensor
+    tokens = tokenizer(text, return_tensors='pt', truncation=True, max_length=128)
+
+    with torch.no_grad():
+        outputs = model(**tokens)
+
+    hidden_states = outputs.hidden_states  # 全層 (13個)
+
+    # ---- 使いたい層を選択 ----
+    h = hidden_states[layer]  # shape: (1, seq_len, 768)
+
+    # ---- CLSベクトルを特徴量にする ----
+    cls_vec = h[:, 0, :].squeeze().numpy()  # shape: (768,)
+
+    return cls_vec
+
+
+def bert_features_batch(text_list, layer=8, batch_size=16):
+
+    all_vecs = []
+
+    for i in range(0, len(text_list), batch_size):
+        batch_texts = text_list[i:i+batch_size]
+
+        # まとめてトークナイズ（padding あり）
+        tokens = tokenizer(batch_texts,
+                           return_tensors='pt',
+                           truncation=True,
+                           padding=True,
+                           max_length=128)
+
+        with torch.no_grad():
+            outputs = model(**tokens)
+
+        hidden_states = outputs.hidden_states
+        h = hidden_states[layer]       # shape: (B, seq_len, 768)
+        mask = tokens["attention_mask"].unsqueeze(-1)
+
+        # mean pooling
+        h_masked = h * mask
+        sum_vec = h_masked.sum(dim=1)
+        len_tokens = mask.sum(dim=1)
+        mean_vec = sum_vec / len_tokens  # shape: (B, 768)
+
+        # numpy に変換
+        all_vecs.append(mean_vec.numpy())
+
+    # 全バッチを結合
+    return np.vstack(all_vecs)
+
+
+
+
+
+pd.set_option('display.max_columns', None)  # すべての列を表示
+pd.set_option('display.width', None)        # 横幅制限を解除
+
+
+retail = pd.read_excel('C:/Users/23X4002/Desktop/3年生秋/PBL/需要予測(広告)/小売データ.xlsx')
+weather= pd.read_csv('C:/Users/23X4002/Desktop/3年生秋/PBL/需要予測(広告)/気象データ03.csv',
+                     encoding='cp932', skiprows=3)
+
+
+
+
+
+# ===== データの結合　 =====
+weather['日付'] = pd.to_datetime(weather['年月日.1'], errors='coerce')
+weather = weather.loc[:, ~weather.columns.str.contains(r'\.\d+$')]
+weather = weather.drop(columns=['最深積雪(cm)', '平均雲量(10分比)', '年月日'])
+weather = weather.drop(index=[0, 1]).reset_index(drop=True)
+
+retail['日付'] = pd.to_datetime(retail['day'])
+retail = retail.drop(columns=['day'])
+
+merged = pd.merge(retail, weather, on = '日付', how = 'left')
+
+
+
+
+
+# ===== 広告施策に対するエンコーディング =====
+# ---- すべての広告を統合 ----
+ad_cols = ['SNS', '売場施策', 'TV放映', 'プロモーション']
+merged[ad_cols] = merged[ad_cols].fillna(0)
+# 各広告列を「あり＝1, なし＝0」でバイナリ化
+for col in ad_cols:
+    merged[col + '_有無'] = (merged[col] != 0).astype(int)
+merged['広告_有無'] = merged[[col + '_有無' for col in ad_cols]].max(axis=1)
+data = merged.drop(columns=ad_cols + [col + '_有無' for col in ad_cols])
+# print(data['広告_有無'].value_counts())
+
+
+
+
+
+# ===== ラグ・移動平均 =====
+data['広告_有無_lag2'] = (
+        data.groupby('name')['広告_有無'].shift(2)
+    )
+data['広告_有無_lag2'] = data[f'広告_有無_lag2'].fillna(0)
+data['売上数_rollmean_prev3'] = (
+    data.groupby('name')['売上数']
+        .apply(lambda s: s.shift(1).rolling(window=3, min_periods=1).mean())
+        .reset_index(level=0, drop=True)
+)
+data['売上数_rollmean_prev3'] = data['売上数_rollmean_prev3'].fillna(0)
+# print(data.head(30))
+
+
+
+
+
+# ===== 欠損値の処理 =====
+# print(merged.isnull().sum())
+data = data[data.index != 3]
+beef_mask = (data['name'] == '焙煎牛肉') & (data.index >= 16) & (data.index <= 94)
+for col in ['売上数', '売上高', '店頭在庫数', '納入予定数', '当店在庫手持週']:
+    if col in data.columns:
+        mean_value = data.loc[beef_mask, col].mean()
+        data.loc[beef_mask, col] = data.loc[beef_mask, col].fillna(mean_value)
+costomer_count_250928 = data[(data['日付'] == '2025-09-28')]['客数'].values[0]
+data['客数'] = data['客数'].fillna(costomer_count_250928)
+num_cols = ['price', '客数', '売上数', '売上高', '店頭在庫数', '納入予定数', '当店在庫手持週',
+            '平均気温(℃)', '降水量の合計(mm)', '日照時間(時間)', '平均風速(m/s)', '平均蒸気圧(hPa)']
+# print(num_cols)
+num_imputer = SimpleImputer(strategy='mean')
+data[num_cols] = num_imputer.fit_transform(data[num_cols])
+# print(merged.isnull().sum())
+
+
+
+
+
+# ===== 外れ値の処理 =====
+for col in num_cols:
+    Q1 = data[col].quantile(0.25)
+    Q3 = data[col].quantile(0.75)
+    IQR = Q3 - Q1
+    lower = Q1 - 1.5 * IQR
+    upper = Q3 + 1.5 * IQR
+    data[col] = np.clip(data[col], lower, upper)
+
+
+
+
+
+# ===== 時系列特徴量 =====
+data['yday'] = data['日付'].dt.dayofyear
+data['yday_sin'] = np.sin(2 * np.pi * data['yday'] / 365)
+data['yday_cos'] = np.cos(2 * np.pi * data['yday'] / 365)
+data = data.drop(columns=['yday'])
+
+
+
+
+
+# ===== nameの特徴量作成 =====
+data_api = data.copy()
+# data_api["bert_vec"] = data_api["name"].apply(bert_features)
+data_api["bert_vec"] = list(bert_features_batch(data_api["name"].tolist(), layer=8))
+
+
+
+
+
+
+# ===== 正規化 =====
+scale_cols = ['price', '客数', '店頭在庫数', '納入予定数', '当店在庫手持週',
+              '平均気温(℃)', '降水量の合計(mm)', '日照時間(時間)', '平均風速(m/s)', '平均蒸気圧(hPa)', '売上数_rollmean_prev3']
+mm_scaler = MinMaxScaler()
+data_mm = data_api.copy()
+data_mm[scale_cols] = mm_scaler.fit_transform(data[scale_cols])
+
+y_scaler = MinMaxScaler()
+y_scaled = y_scaler.fit_transform(data[['売上数']])
+data_mm['売上数'] = y_scaled
+print(data_mm.head(-1))
+print(data_mm.describe())
+print(data_mm.info())
+
+
+
+
+
+# ===== 特徴量の選択 =====
+# select_cols = ['客数', '売上数_rollmean_prev3', '店頭在庫数', '当店在庫手持週', 'name_【2辛】素材を生かしたカレー 6代目バターチキン',
+#                'name_【3辛】焙煎スパイスのごろり牛肉カレー', '日照時間(時間)', 'name_【4辛】素材を生かした牛ばら肉の大盛カレー', '降水量の合計(mm)', 'name_【5辛】素材を生かしたカレー グリーン',
+#                'yday_sin', '平均気温(℃)', '平均風速(m/s)', '納入予定数', 'yday_cos',
+#                '広告_有無_lag2']
+exclude_cols = ['name', '売上数', '売上高','日付', '広告_有無', "bert_vec"]
+target = '売上数'
+X_bert = np.vstack(data_mm["bert_vec"].values)  # shape: (n_samples, 768)
+X_num = data_mm.drop(columns=exclude_cols).values  # 数値特徴量
+X = np.hstack([X_num, X_bert])
+# X = data_mm[select_cols]
+y = data_mm[target].values
+print(X.shape, y.shape)
+
+
+
+
+
+
+# ===== RFの実装 =====
+# ----- rfのパラメータチューニング（GridSearchCV） -----
+tscv = TimeSeriesSplit(n_splits=5)
+rf = RandomForestRegressor(random_state=42)
+param_grid = {
+    "n_estimators": [200, 500, 1000],
+    "max_depth": [10, 30, None]
+}
+grid_search = GridSearchCV(
+    rf,
+    param_grid,
+    cv=tscv,
+    scoring='neg_mean_squared_error',
+    n_jobs=-1,
+    verbose=1
+)
+grid_search.fit(X, y)
+print("===== 最適パラメータ =====")
+print(grid_search.best_params_)
+best_rf = grid_search.best_estimator_
+
+
+
+
+
+# ----- クロスバリデーションの評価 -----
+rmse_scores = []
+mae_scores = []
+r2_scores = []
+
+for train_idx, test_idx in tscv.split(X):
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    best_rf.fit(X_train, y_train)
+    y_pred = best_rf.predict(X_test)
+
+    # --- スケールを元に戻す ---
+    y_pred_inv = y_scaler.inverse_transform(y_pred.reshape(-1, 1))
+    y_test_inv = y_scaler.inverse_transform(y_test.reshape(-1, 1))
+
+    # --- 評価 ---
+    rmse = np.sqrt(mean_squared_error(y_test_inv, y_pred_inv))
+    mae = mean_absolute_error(y_test_inv, y_pred_inv)
+    r2 = r2_score(y_test_inv, y_pred_inv)
+
+    rmse_scores.append(rmse)
+    mae_scores.append(mae)
+    r2_scores.append(r2)
+
+print("===== ランダムフォレスト評価結果 =====")
+print(f"平均RMSE: {np.mean(rmse_scores):.4f}")
+print(f"平均MAE: {np.mean(mae_scores):.4f}")
+print(f"平均R²:  {np.mean(r2_scores):.4f}")
+
