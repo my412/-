@@ -5,6 +5,7 @@ from collections import OrderedDict
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
+import japanize_matplotlib
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.impute import SimpleImputer
@@ -67,7 +68,112 @@ def bert_features_batch(text_list, layer=8, batch_size=16):
     return np.vstack(all_vecs)
 
 
+# --- 前処理を関数化 ---
+def preprocess(retail_df, weather_df):
+    # 日付処理
+    weather_df['日付'] = pd.to_datetime(weather_df['年月日.1'], errors='coerce')
+    weather_df = weather_df.loc[:, ~weather_df.columns.str.contains(r'\.\d+$')]
+    weather_df = weather_df.drop(columns=['最深積雪(cm)', '平均雲量(10分比)', '年月日'], errors='ignore')
+    weather_df = weather_df.drop(index=[0, 1]).reset_index(drop=True)
 
+    retail_df['日付'] = pd.to_datetime(retail_df['day'])
+    retail_df = retail_df.drop(columns=['day'])
+
+    merged = pd.merge(retail_df, weather_df, on='日付', how='left')
+
+    # 広告統合とバイナリ化
+    ad_cols = ['SNS', '売場施策', 'TV放映', 'プロモーション']
+    for col in ad_cols:
+        if col not in merged.columns:
+            merged[col] = 0
+    merged[ad_cols] = merged[ad_cols].fillna(0)
+    for col in ad_cols:
+        merged[col + '_有無'] = (merged[col] != 0).astype(int)
+    merged['広告_有無'] = merged[[c + '_有無' for c in ad_cols]].max(axis=1)
+    merged = merged.drop(columns = ad_cols + [col + '_有無' for col in ad_cols])
+
+    # ラグ特徴量（商品ごと）
+    for lag in [1, 2, 3]:
+        merged[f'広告_有無_lag{lag}'] = merged.groupby('name')['広告_有無'].shift(lag).fillna(0).astype(int)
+
+    # 移動平均（1つ前からの3点移動平均）
+    merged['売上数_rollmean_prev3'] = (
+        merged.groupby('name')['売上数']
+              .apply(lambda s: s.shift(1).rolling(window=3, min_periods=1).mean())
+              .reset_index(level=0, drop=True)
+    ).fillna(0)
+
+    # 特定の欠損処理（元スクリプトの意図を踏襲）
+    merged = merged[merged.index != 3]  # 元コードで除外していた行
+    beef_mask = (merged['name'] == '焙煎牛肉') & (merged.index >= 16) & (merged.index <= 94)
+    for col in ['売上数', '売上高', '店頭在庫数', '納入予定数', '当店在庫手持週']:
+        if col in merged.columns:
+            mean_value = merged.loc[beef_mask, col].mean()
+            merged.loc[beef_mask, col] = merged.loc[beef_mask, col].fillna(mean_value)
+
+    # 客数の欠損埋め（元コードの値を参照）
+    if '客数' in merged.columns:
+        try:
+            costomer_count_250928 = merged.loc[merged['日付'] == pd.to_datetime('2025-09-28'), '客数'].values[0]
+            merged['客数'] = merged['客数'].fillna(costomer_count_250928)
+        except Exception:
+            merged['客数'] = merged['客数'].fillna(merged['客数'].mean())
+
+    # 数値列の平均補完
+    num_cols = ['price', '客数', '売上数', '売上高', '店頭在庫数', '納入予定数', '当店在庫手持週',
+                '平均気温(℃)', '降水量の合計(mm)', '日照時間(時間)', '平均風速(m/s)', '平均蒸気圧(hPa)']
+    num_cols = [c for c in num_cols if c in merged.columns]
+    num_imputer = SimpleImputer(strategy='mean')
+    merged[num_cols] = num_imputer.fit_transform(merged[num_cols])
+
+    # IQRクリッピング（外れ値処理）
+    for col in num_cols:
+        Q1 = merged[col].quantile(0.25)
+        Q3 = merged[col].quantile(0.75)
+        IQR = Q3 - Q1
+        lower = Q1 - 1.5 * IQR
+        upper = Q3 + 1.5 * IQR
+        merged[col] = merged[col].clip(lower, upper)
+
+    # 時系列特徴量
+    SEASON = {1: "WINTER",2: "WINTER",3: "SPRING",4: "SPRING",5: "SPRING",
+              6: "SUMMER",7: "SUMMER",8: "SUMMER",9: "FALL",10: "FALL",11: "FALL",12: "WINTER"}
+    merged['月'] = merged['日付'].dt.month
+    merged['週'] = merged['日付'].dt.isocalendar().week
+    merged['年'] = merged['日付'].dt.year
+    merged['yday'] = merged['日付'].dt.dayofyear
+    merged['season'] = merged['月'].map(SEASON)
+
+    merged['yday_sin'] = np.sin(2 * np.pi * merged['yday'] / 365)
+    merged['yday_cos'] = np.cos(2 * np.pi * merged['yday'] / 365)
+
+    merged = merged.drop(columns=['月', '週', '年', 'yday'])
+
+    # season のダミー化
+    merged = pd.get_dummies(merged, columns=['season'], drop_first=True, dtype=int)
+
+    # 正規化（min-max） --- 注意: スケールは学習データで fit するのが理想だが、ここは簡易処理
+    scale_cols = ['price', '客数', '店頭在庫数', '納入予定数', '当店在庫手持週',
+                  '平均気温(℃)', '降水量の合計(mm)', '日照時間(時間)', '平均風速(m/s)', '平均蒸気圧(hPa)']
+    sales_max = merged['売上数'].max()
+    sales_min = merged['売上数'].min()
+    scale_cols = [c for c in scale_cols if c in merged.columns]
+    mm = MinMaxScaler()
+    merged[scale_cols] = mm.fit_transform(merged[scale_cols])
+
+    ## 🚀 相互作用特徴量 (Interaction Features) の生成
+    # 1. 当店在庫手持週 と 広告有無_lag2 の相互作用項
+    merged['Interaction_在庫手持週_広告'] = merged['当店在庫手持週'] * merged['広告_有無_lag2']
+    # 2. 店頭在庫数 と 広告有無_lag2 の相互作用項
+    merged['Interaction_店頭在庫数_広告'] = merged['店頭在庫数'] * merged['広告_有無_lag2']
+    # 3. 納入予定数 と 広告有無_lag2 の相互作用項 (Optional: 相関が高かったため追加)
+    merged['Interaction_納入予定数_広告'] = merged['納入予定数'] * merged['広告_有無_lag2']
+    merged['Interaction_客数_広告'] = merged['客数'] * merged['広告_有無_lag2']
+    merged['Interaction_price_広告'] = merged['price'] * merged['広告_有無_lag2']
+
+    # 使いやすい順に列を整える（任意）
+    merged = merged.reset_index(drop=True)
+    return merged
 
 
 # --- ヘルパー: numpy -> torch tensor 変換 ---
@@ -75,9 +181,6 @@ def to_tensor_Xy(X_np, y_np):
     X_t = torch.from_numpy(X_np.astype(np.float32))
     y_t = torch.from_numpy(y_np.astype(np.float32)).reshape(-1, 1)
     return X_t, y_t
-
-
-
 
 
 # ===== ANNの関数 =====
@@ -102,18 +205,26 @@ def training_loop_ann(n_epochs, optimizer, scheduler, model, loss_fn, X_train, X
         train_losses.append(loss_train.item())
         val_losses.append(loss_test.item())
 
-        if epoch == 1 or epoch % 1000 == 0:
-            print(f"Epoch {epoch:5d} | Training loss {loss_train.item():.4f} | Validation loss {loss_test.item():.4f}")
+        # if epoch == 1 or epoch % 1000 == 0:
+        #     print(f"Epoch {epoch:5d} | Training loss {loss_train.item():.4f} | Validation loss {loss_test.item():.4f}")
 
     return train_losses, val_losses
 
 
 def train_model_ann(X_train, X_val, y_train, y_val, input_size, title):
     model = nn.Sequential(OrderedDict([
-        ('hidden1', nn.Linear(input_size, 50)),
+        ('hidden1', nn.Linear(input_size, 100)),
+        ('bn1', nn.BatchNorm1d(100)),
         ('act1', nn.ReLU()),
-        ('hidden2', nn.Linear(50, 25)),
+        ('drop1', nn.Dropout(0.3)),
+        ('hidden2', nn.Linear(100, 50)),
+        ('bn2', nn.BatchNorm1d(50)),
         ('act2', nn.ReLU()),
+        ('drop2', nn.Dropout(0.3)),
+        ('hidden3', nn.Linear(50, 25)),
+        ('bn3', nn.BatchNorm1d(25)),
+        ('act3', nn.ReLU()),
+        ('drop3', nn.Dropout(0.2)),
         ('output', nn.Linear(25, 1))
     ]))
 
@@ -133,6 +244,9 @@ def train_model_ann(X_train, X_val, y_train, y_val, input_size, title):
         y_test=y_val
     )
 
+
+    '''
+
     # ----- 学習曲線プロット -----
     plt.figure(figsize=(10, 5))
     plt.plot(train_losses, label='Train Loss')
@@ -142,6 +256,7 @@ def train_model_ann(X_train, X_val, y_train, y_val, input_size, title):
     plt.ylabel('MSE Loss')
     plt.legend()
     plt.show()
+    '''
 
     return model
 
@@ -167,11 +282,13 @@ def evaluate_model_ann(model, X_val, y_val, title, sales_max, sales_min):
     r2 = r2_score(y_true, y_pred)
     '''
 
-    print(f"\n=== {title} の評価結果 ===")
-    print(f"RMSE（平均二乗誤差の平方根）: {rmse:.4f}")
-    print(f"MAE（平均絶対誤差）: {mae:.4f}")
-    print(f"R²（決定係数）: {r2:.4f}\n")
+    # print(f"\n=== {title} の評価結果 ===")
+    # print(f"RMSE（平均二乗誤差の平方根）: {rmse:.4f}")
+    # print(f"MAE（平均絶対誤差）: {mae:.4f}")
+    # print(f"R²（決定係数）: {r2:.4f}\n")
 
+
+    '''
     # === 2. 予測値 vs 実測値 ===
     plt.figure(figsize=(6, 6))
     plt.scatter(y_true, y_pred, alpha=0.6)
@@ -183,6 +300,7 @@ def evaluate_model_ann(model, X_val, y_val, title, sales_max, sales_min):
     plt.legend()
     plt.grid(True)
     plt.show()
+    '''
 
     return rmse, mae, r2
 
@@ -231,102 +349,14 @@ weather= pd.read_csv('C:/Users/23X4002/Desktop/3年生秋/PBL/需要予測(広�
                      encoding='cp932', skiprows=3)
 
 
-
-
-
-# ===== データの結合　 =====
-weather['日付'] = pd.to_datetime(weather['年月日.1'], errors='coerce')
-weather = weather.loc[:, ~weather.columns.str.contains(r'\.\d+$')]
-weather = weather.drop(columns=['最深積雪(cm)', '平均雲量(10分比)', '年月日'])
-weather = weather.drop(index=[0, 1]).reset_index(drop=True)
-
-retail['日付'] = pd.to_datetime(retail['day'])
-retail = retail.drop(columns=['day'])
-
-merged = pd.merge(retail, weather, on = '日付', how = 'left')
-
-
-
-
-
-# ===== 広告施策に対するエンコーディング =====
-# ---- すべての広告を統合 ----
-ad_cols = ['SNS', '売場施策', 'TV放映', 'プロモーション']
-merged[ad_cols] = merged[ad_cols].fillna(0)
-# 各広告列を「あり＝1, なし＝0」でバイナリ化
-for col in ad_cols:
-    merged[col + '_有無'] = (merged[col] != 0).astype(int)
-merged['広告_有無'] = merged[[col + '_有無' for col in ad_cols]].max(axis=1)
-data = merged.drop(columns=ad_cols + [col + '_有無' for col in ad_cols])
-# print(data['広告_有無'].value_counts())
-
-
-
-
-
-# ===== ラグ・移動平均 =====
-data['広告_有無_lag2'] = (
-        data.groupby('name')['広告_有無'].shift(2)
-    )
-data['広告_有無_lag2'] = data[f'広告_有無_lag2'].fillna(0)
-data['売上数_rollmean_prev3'] = (
-    data.groupby('name')['売上数']
-        .apply(lambda s: s.shift(1).rolling(window=3, min_periods=1).mean())
-        .reset_index(level=0, drop=True)
-)
-data['売上数_rollmean_prev3'] = data['売上数_rollmean_prev3'].fillna(0)
-# print(data.head(30))
-
-
-
-
-
-# ===== 欠損値の処理 =====
-# print(merged.isnull().sum())
-data = data[data.index != 3]
-beef_mask = (data['name'] == '焙煎牛肉') & (data.index >= 16) & (data.index <= 94)
-for col in ['売上数', '売上高', '店頭在庫数', '納入予定数', '当店在庫手持週']:
-    if col in data.columns:
-        mean_value = data.loc[beef_mask, col].mean()
-        data.loc[beef_mask, col] = data.loc[beef_mask, col].fillna(mean_value)
-costomer_count_250928 = data[(data['日付'] == '2025-09-28')]['客数'].values[0]
-data['客数'] = data['客数'].fillna(costomer_count_250928)
-num_cols = ['price', '客数', '売上数', '売上高', '店頭在庫数', '納入予定数', '当店在庫手持週',
-            '平均気温(℃)', '降水量の合計(mm)', '日照時間(時間)', '平均風速(m/s)', '平均蒸気圧(hPa)']
-# print(num_cols)
-num_imputer = SimpleImputer(strategy='mean')
-data[num_cols] = num_imputer.fit_transform(data[num_cols])
-# print(merged.isnull().sum())
-
-
-
-
-
-# ===== 外れ値の処理 =====
-for col in num_cols:
-    Q1 = data[col].quantile(0.25)
-    Q3 = data[col].quantile(0.75)
-    IQR = Q3 - Q1
-    lower = Q1 - 1.5 * IQR
-    upper = Q3 + 1.5 * IQR
-    data[col] = np.clip(data[col], lower, upper)
-
-
-
-
-
-# ===== 時系列特徴量 =====
-data['yday'] = data['日付'].dt.dayofyear
-data['yday_sin'] = np.sin(2 * np.pi * data['yday'] / 365)
-data['yday_cos'] = np.cos(2 * np.pi * data['yday'] / 365)
-data = data.drop(columns=['yday'])
+data_mm = preprocess(retail, weather)
 
 
 
 
 
 # ===== nameの特徴量作成 =====
-data_api = data.copy()
+data_api = data_mm.copy()
 # data_api["bert_vec"] = data_api["name"].apply(bert_features)
 data_api["bert_vec"] = list(bert_features_batch(data_api["name"].tolist(), layer=8))
 
@@ -335,19 +365,80 @@ data_api["bert_vec"] = list(bert_features_batch(data_api["name"].tolist(), layer
 
 
 
-# ===== 正規化 =====
-scale_cols = ['price', '客数', '店頭在庫数', '納入予定数', '当店在庫手持週',
-              '平均気温(℃)', '降水量の合計(mm)', '日照時間(時間)', '平均風速(m/s)', '平均蒸気圧(hPa)', '売上数_rollmean_prev3']
-mm_scaler = MinMaxScaler()
-data_mm = data_api.copy()
-data_mm[scale_cols] = mm_scaler.fit_transform(data[scale_cols])
+# ===== 分析の結果からbertの463列目の要素について商品の特徴を考察 =====
+def analyze_bert_dimension(df: pd.DataFrame, dim_index: int, top_n: int = 10):
+    """
+    特定のBERT次元の値に基づいて、商品名（name）のTop NとBottom Nを抽出し、表示する。
 
+    Args:
+        df (pd.DataFrame): 'name'列と 'bert_vec'列を含むDataFrame。
+        dim_index (int): 抽出したいBERTベクトルのインデックス（0から始まる）。
+        top_n (int): 表示するTop/Bottomの数。
+    """
+    dim_num = dim_index + 1
+    dim_col_name = f'bert_vec_{dim_num}_val'
+
+    # 1. BERT次元の値を抽出
+    try:
+        # ベクトルの指定された次元を新しい列として追加
+        df[dim_col_name] = df['bert_vec'].apply(lambda x: x[dim_index])
+    except IndexError:
+        print(f"エラー: BERTベクトルのインデックス {dim_index} が存在しません。")
+        return
+
+    # 2. 統計情報の表示
+    print(f"\n--- {dim_col_name} の統計情報 ---")
+    print(df[dim_col_name].describe())
+
+    # 3. ユニークな商品名ベースでソートし、Top/Bottom Nを抽出
+    df_unique_names = df.drop_duplicates(subset=['name'])
+
+    # Top N
+    top_names = (
+        df_unique_names.sort_values(by=dim_col_name, ascending=False)
+        .head(top_n)['name'].tolist()
+    )
+    # Bottom N
+    bottom_names = (
+        df_unique_names.sort_values(by=dim_col_name, ascending=True)
+        .head(top_n)['name'].tolist()
+    )
+
+    # 4. 結果出力
+    print(f"\n====================================")
+    print(f"📈 {dim_col_name} が最も高い商品名 (Top {top_n})")
+    print(f"====================================")
+    for i, name in enumerate(top_names, 1):
+        print(f"{i}. {name}")
+
+    print(f"\n====================================")
+    print(f"📉 {dim_col_name} が最も低い商品名 (Bottom {top_n})")
+    print(f"====================================")
+    for i, name in enumerate(bottom_names, 1):
+        print(f"{i}. {name}")
+
+    # 考察のヒントは今回は省略 (関数内では自動出力しない)
+
+    # 処理後に一時列を削除（任意）
+    del df[dim_col_name]
+analyze_bert_dimension(data_api.copy(), dim_index=462, top_n=5)
+analyze_bert_dimension(data_api.copy(), dim_index=571, top_n=5)
+analyze_bert_dimension(data_api.copy(), dim_index=463, top_n=5)
+
+
+
+
+
+# ===== 正規化 =====
 y_scaler = MinMaxScaler()
-y_scaled = y_scaler.fit_transform(data[['売上数']])
-data_mm['売上数'] = y_scaled
-print(data_mm.head(-1))
-print(data_mm.describe())
-print(data_mm.info())
+y_scaler.fit(data_api[['売上数']])
+# # --- デバッグ情報 (data_api を使用) ---
+# print("\n--- データ (data_api) のヘッダー ---")
+# print(data_api.head(3))
+# print("\n--- データ (data_api) の概要 ---")
+# print(data_api.describe())
+# print("\n--- データ (data_api) の情報 ---")
+# print(data_api.info())
 
 
 
@@ -358,20 +449,131 @@ print(data_mm.info())
 #                'name_【3辛】焙煎スパイスのごろり牛肉カレー', '日照時間(時間)', 'name_【4辛】素材を生かした牛ばら肉の大盛カレー', '降水量の合計(mm)', 'name_【5辛】素材を生かしたカレー グリーン',
 #                'yday_sin', '平均気温(℃)', '平均風速(m/s)', '納入予定数', 'yday_cos',
 #                '広告_有無_lag2']
-exclude_cols = ['name', '売上数', '売上高','日付', '広告_有無', "bert_vec"]
+exclude_cols = ['name', '売上数', '売上高','日付', '広告_有無','広告_有無_lag1', '広告_有無_lag3',
+                'Interaction_納入予定数_広告', 'Interaction_客数_広告', 'Interaction_price_広告', "bert_vec"]
 target = '売上数'
-X_bert = np.vstack(data_mm["bert_vec"].values)  # shape: (n_samples, 768)
-X_num = data_mm.drop(columns=exclude_cols).values  # 数値特徴量
+X_bert = np.vstack(data_api["bert_vec"].values)  # shape: (n_samples, 768)
+X_num_df = data_api.drop(columns=exclude_cols, errors='ignore')
+X_num = X_num_df.values
+# ターゲット変数
+y_unscaled = data_api[target].values.reshape(-1, 1) # スケーリング前のターゲット
+y = y_scaler.transform(y_unscaled) # スケーリング
+
 X = np.hstack([X_num, X_bert])
-# X = data_mm[select_cols]
-y = data_mm[target].values
-print(X.shape, y.shape)
+print(f"\n最終的な特徴量 X の形状: {X.shape}, ターゲット y の形状: {y.shape}")
+# X_num_df の列名を確認 (デバッグ用)
+# print("X_num の列:")
+# print(X_num_df.columns.tolist())
+
 
 
 
 
 
 # ===== ANNの実装 =====
-tscv = TimeSeriesSplit(n_splits=5)
+tscv = TimeSeriesSplit(n_splits=30)
 print("Start ANN CV ...")
 ann_rmse, ann_mae, ann_r2 = run_ann_cv(X, y, tscv=tscv)
+
+
+
+
+
+# ===== PIを利用して特徴量の重要度を可視化 =====
+# --- PFI のための関数 (scikit-learn の permutation_importance を利用するのが一般的ですが、今回は手動で実装) ---
+
+def calculate_permutation_importance(model, X_val_t, y_val_t, feature_names, sales_max, sales_min,
+                                     loss_fn=mean_squared_error):
+    model.eval()
+
+    # 1. ベースラインのスコアを取得 (シャッフルなし)
+    with torch.no_grad():
+        y_pred_base = model(X_val_t).squeeze().numpy()
+        y_true = y_val_t.squeeze().numpy()
+
+    # スケールを元に戻す
+    y_true_orig = y_true * (sales_max - sales_min) + sales_min
+    y_pred_base_orig = y_pred_base * (sales_max - sales_min) + sales_min
+    base_score = loss_fn(y_true_orig, y_pred_base_orig)
+
+    importance = {}
+    X_val_np = X_val_t.numpy()
+
+    # 2. 各特徴量を順番にシャッフル
+    for i, name in enumerate(feature_names):
+        # 元のテンソルをコピー
+        X_shuffled_np = X_val_np.copy()
+
+        # i番目の特徴量だけをシャッフル
+        X_shuffled_np[:, i] = np.random.permutation(X_shuffled_np[:, i])
+
+        # シャッフルしたテンソルで予測
+        X_shuffled_t = torch.from_numpy(X_shuffled_np.astype(np.float32))
+
+        with torch.no_grad():
+            y_pred_shuffled = model(X_shuffled_t).squeeze().numpy()
+
+        # スケールを元に戻してスコア計算
+        y_pred_shuffled_orig = y_pred_shuffled * (sales_max - sales_min) + sales_min
+        shuffled_score = loss_fn(y_true_orig, y_pred_shuffled_orig)
+
+        # 重要度: (シャッフル後のスコア - ベースラインスコア) / ベースラインスコア
+        # RMSEベースで計算
+        importance[name] = (np.sqrt(shuffled_score) - np.sqrt(base_score)) / np.sqrt(base_score)
+
+    return importance, base_score
+
+
+# --- PFI 実行部分 ---
+# 最終的な特徴量の列名リストを作成
+num_feature_names = X_num_df.columns.tolist()
+# BERTベクトルは768次元あるため、個別の列名を付ける
+bert_feature_names = [f"bert_vec_{i}" for i in range(X_bert.shape[1])]
+all_feature_names = num_feature_names + bert_feature_names
+
+# CV の最終 Fold のデータで再学習・評価
+final_train_idx, final_test_idx = list(tscv.split(X))[-1]
+X_train_np, X_test_np = X[final_train_idx], X[final_test_idx]
+y_train_np, y_test_np = y[final_train_idx], y[final_test_idx]
+
+X_train_t, y_train_t = to_tensor_Xy(X_train_np, y_train_np)
+X_val_t, y_val_t = to_tensor_Xy(X_test_np, y_test_np)
+
+print("\n--- Final Model Training for PFI ---")
+final_model = train_model_ann(X_train_t, X_val_t, y_train_t, y_val_t,
+                              input_size=X.shape[1], title="Final Model")
+
+sales_max = y_scaler.data_max_[0]
+sales_min = y_scaler.data_min_[0]
+
+# PFI の計算（ここでは簡略化のため MSE を使用、評価関数に合わせて RMSE を計算）
+importance_results, base_mse = calculate_permutation_importance(
+    final_model,
+    X_val_t,
+    y_val_t,
+    all_feature_names,
+    sales_max,
+    sales_min,
+    loss_fn=mean_squared_error
+)
+
+# 結果を DataFrame にしてソート
+importance_df = pd.DataFrame(
+    list(importance_results.items()),
+    columns=['Feature', 'Importance (RMSE increase %)']
+).sort_values(by='Importance (RMSE increase %)', ascending=False)
+
+print("\n=== Permutation Feature Importance Top 30 ===")
+print(importance_df.head(30))
+
+# --- 可視化 ---
+plt.figure(figsize=(10, 6))
+top_n = 20
+df_plot = importance_df.head(top_n).sort_values(by='Importance (RMSE increase %)', ascending=True)
+plt.barh(df_plot['Feature'], df_plot['Importance (RMSE increase %)'])
+plt.title(f'Top {top_n} Feature Importance (Permutation)')
+plt.xlabel('RMSE Increase Ratio')
+plt.ylabel('Feature')
+plt.grid(axis='x', linestyle='--')
+plt.tight_layout()
+plt.show()
