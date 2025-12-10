@@ -12,63 +12,12 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import MinMaxScaler
 import lightgbm as lgb
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
+from typing import Dict, Any, Tuple
 
 
 # ---- モデル読み込み（中間層を返す設定） ----
 tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 model = BertModel.from_pretrained("bert-base-uncased", output_hidden_states=True)
-
-def bert_features(text, layer=8):
-    # テキスト → Tensor
-    tokens = tokenizer(text, return_tensors='pt', truncation=True, max_length=128)
-
-    with torch.no_grad():
-        outputs = model(**tokens)
-
-    hidden_states = outputs.hidden_states  # 全層 (13個)
-
-    # ---- 使いたい層を選択 ----
-    h = hidden_states[layer]  # shape: (1, seq_len, 768)
-
-    # ---- CLSベクトルを特徴量にする ----
-    cls_vec = h[:, 0, :].squeeze().numpy()  # shape: (768,)
-
-    return cls_vec
-
-
-def bert_features_batch(text_list, layer=8, batch_size=16):
-
-    all_vecs = []
-
-    for i in range(0, len(text_list), batch_size):
-        batch_texts = text_list[i:i+batch_size]
-
-        # まとめてトークナイズ（padding あり）
-        tokens = tokenizer(batch_texts,
-                           return_tensors='pt',
-                           truncation=True,
-                           padding=True,
-                           max_length=128)
-
-        with torch.no_grad():
-            outputs = model(**tokens)
-
-        hidden_states = outputs.hidden_states
-        h = hidden_states[layer]       # shape: (B, seq_len, 768)
-        mask = tokens["attention_mask"].unsqueeze(-1)
-
-        # mean pooling
-        h_masked = h * mask
-        sum_vec = h_masked.sum(dim=1)
-        len_tokens = mask.sum(dim=1)
-        mean_vec = sum_vec / len_tokens  # shape: (B, 768)
-
-        # numpy に変換
-        all_vecs.append(mean_vec.numpy())
-
-    # 全バッチを結合
-    return np.vstack(all_vecs)
 
 
 # --- 前処理を関数化 ---
@@ -172,6 +121,257 @@ def preprocess(retail_df, weather_df):
     return merged
 
 
+# --- 連続広告有無の特徴量作成 ---
+def add_continuous_ad_features(df):
+    """
+    'name' ごとに '広告_有無' の連続回数と、そのラグ特徴量を作成する。
+    """
+    df_copy = df.copy()
+
+    def calculate_consecutive_ad(series):
+        # 1. 連続する値のブロックIDを作成
+        # series.ne(series.shift()).cumsum() で、値が変わるたびにインデックスが増えるIDを作成
+        # 例: [1, 1, 0, 1, 1, 1, 0, 0, 1] -> [1, 1, 2, 3, 3, 3, 4, 4, 5]
+        block_id = series.ne(series.shift()).cumsum()
+
+        # 2. block_idでグループ化し、各ブロック内で累積カウント (1から開始)
+        consecutive_count = series.groupby(block_id).cumcount() + 1
+
+        # 3. 広告がない期間 (値が0の期間) のカウントを0にする
+        consecutive_count[series == 0] = 0
+
+        return consecutive_count.astype(int)
+
+    df_copy['広告_有無_連続'] = (
+        df_copy.groupby('name')['広告_有無']
+               .transform(calculate_consecutive_ad)
+    )
+
+    # 2. ラグ特徴量を作成
+    for lag in [1, 2, 3]:
+        df_copy[f'広告_有無_連続_lag{lag}'] = (
+            df_copy.groupby('name')['広告_有無_連続'].shift(lag).fillna(0).astype(int)
+        )
+
+    return df_copy
+
+
+def bert_features(text, layer=8):
+    # テキスト → Tensor
+    tokens = tokenizer(text, return_tensors='pt', truncation=True, max_length=128)
+
+    with torch.no_grad():
+        outputs = model(**tokens)
+
+    hidden_states = outputs.hidden_states  # 全層 (13個)
+
+    # ---- 使いたい層を選択 ----
+    h = hidden_states[layer]  # shape: (1, seq_len, 768)
+
+    # ---- CLSベクトルを特徴量にする ----
+    cls_vec = h[:, 0, :].squeeze().numpy()  # shape: (768,)
+
+    return cls_vec
+
+
+def bert_features_batch(text_list, layer=8, batch_size=16):
+
+    all_vecs = []
+
+    for i in range(0, len(text_list), batch_size):
+        batch_texts = text_list[i:i+batch_size]
+
+        # まとめてトークナイズ（padding あり）
+        tokens = tokenizer(batch_texts,
+                           return_tensors='pt',
+                           truncation=True,
+                           padding=True,
+                           max_length=128)
+
+        with torch.no_grad():
+            outputs = model(**tokens)
+
+        hidden_states = outputs.hidden_states
+        h = hidden_states[layer]       # shape: (B, seq_len, 768)
+        mask = tokens["attention_mask"].unsqueeze(-1)
+
+        # mean pooling
+        h_masked = h * mask
+        sum_vec = h_masked.sum(dim=1)
+        len_tokens = mask.sum(dim=1)
+        mean_vec = sum_vec / len_tokens  # shape: (B, 768)
+
+        # numpy に変換
+        all_vecs.append(mean_vec.numpy())
+
+    # 全バッチを結合
+    return np.vstack(all_vecs)
+
+
+# --- BERT特徴量の次元削減（自己符号化器） ---
+# 1. Autoencoderモデルの定義
+class Autoencoder(nn.Module):
+    def __init__(self, input_dim, latent_dim):
+        super().__init__()
+
+        # エンコーダー (768 -> 512 -> 128)
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, latent_dim)  # LATENT_DIM (低次元の特徴量)
+        )
+
+        # デコーダー (128 -> 512 -> 768)
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, input_dim)  # 元の次元に戻す
+        )
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+
+# 2. 学習と次元削減を行う関数
+def reduce_bert_dimension(df, input_dim=768, latent_dim=128, epochs=50, lr=1e-3):
+    print("\n--- Autoencoderによる次元削減を開始 ---")
+
+    bert_data_np = np.vstack(df["bert_vec"].values)
+
+    scaler = StandardScaler()
+    bert_scaled_np = scaler.fit_transform(bert_data_np)
+
+    X_tensor = torch.from_numpy(bert_scaled_np).float()
+
+    model = Autoencoder(input_dim, latent_dim)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+
+    for epoch in range(epochs):
+        model.train()
+
+        # 順伝播
+        outputs = model(X_tensor)
+        loss = criterion(outputs, X_tensor)  # 入力データ X_tensor を再現できるか
+
+        # 逆伝播と最適化
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if (epoch + 1) % 10 == 0:
+            print(f'Epoch [{epoch + 1}/{epochs}], Loss: {loss.item():.6f}')
+
+    model.eval()
+    with torch.no_grad():
+        # エンコーダー部分のみを使用して特徴量を抽出
+        reduced_features_tensor = model.encoder(X_tensor)
+
+    # Tensor -> NumPy
+    reduced_features_np = reduced_features_tensor.numpy()
+
+    df_reduced = df.copy()
+    df_reduced['bert_vec_reduced'] = list(reduced_features_np)
+
+    df_reduced = df_reduced.drop(columns=['bert_vec'])
+
+    print(f"次元削減完了: {input_dim}次元 -> {latent_dim}次元")
+    return df_reduced
+
+
+# --- データの選択、分割、正規化 (目的変数スケーリング対応) ---
+def prepare_data_for_ann(df, target_col='売上数'):
+    # 目的変数の設定
+    y = df[target_col].values.reshape(-1, 1)  # MinMaxScalerのため2次元に整形
+    # y = np.log1p(y) # 対数変換
+
+    # -----------------------------------------------------------
+    # 1. 特徴量の選択と結合
+    # -----------------------------------------------------------
+
+    # 除外する列
+    drop_cols = ['name', '日付', '売上高', target_col]
+
+    # BERT特徴量を DataFrame の列に戻す
+    bert_reduced_df = pd.DataFrame(df['bert_vec_reduced'].tolist(),
+                                   index=df.index,
+                                   columns=[f'bert_reduced_{i}' for i in
+                                            range(df['bert_vec_reduced'].iloc[0].shape[0])])
+
+    # 最終的な特徴量 DataFrame の作成
+    X_base = df.drop(columns=drop_cols + ['bert_vec_reduced'], errors='ignore')
+    X = pd.concat([X_base, bert_reduced_df], axis=1)
+
+    feature_names = X.columns.tolist()
+
+    # -----------------------------------------------------------
+    # 2. 訓練:検証:テスト = 8:1:1 のデータ分割 (変更なし)
+    # -----------------------------------------------------------
+
+    train_ratio = 0.8
+    val_test_ratio = 0.2
+    val_ratio_in_val_test = 0.5
+
+    n_samples = len(X)
+    n_train = int(n_samples * train_ratio)
+    n_val_test = n_samples - n_train
+    n_val = int(n_val_test * val_ratio_in_val_test)
+
+    train_idx = X.index[:n_train]
+    val_idx = X.index[n_train:n_train + n_val]
+    test_idx = X.index[n_train + n_val:n_samples]
+
+    # データセットの分割
+    X_train, y_train = X.loc[train_idx], y[train_idx]
+    X_val, y_val = X.loc[val_idx], y[val_idx]
+    X_test, y_test = X.loc[test_idx], y[test_idx]
+
+    print(f"訓練データ数: {len(X_train)} ({len(X_train) / n_samples * 100:.1f}%)")
+
+    # -----------------------------------------------------------
+    # 3. 訓練データに基づく正規化（特徴量:StandardScaler, 目的変数:MinMaxScaler）
+    # -----------------------------------------------------------
+
+    # 特徴量 (X) の正規化: StandardScaler
+    X_scaler = StandardScaler()
+    X_scaler.fit(X_train)
+    X_train_scaled = X_scaler.transform(X_train)
+    X_val_scaled = X_scaler.transform(X_val)
+    X_test_scaled = X_scaler.transform(X_test)
+
+    # 目的変数 (y) の正規化: MinMaxScaler
+    y_scaler = MinMaxScaler()
+    y_scaler.fit(y_train)  # 訓練データのみで fit
+    y_train_scaled = y_scaler.transform(y_train)
+    y_val_scaled = y_scaler.transform(y_val)
+    y_test_scaled = y_scaler.transform(y_test)
+
+    print("特徴量および目的変数データのスケーリングが完了しました。")
+
+    # -----------------------------------------------------------
+    # 4. PyTorch Tensor への変換
+    # -----------------------------------------------------------
+
+    X_train_t, y_train_t = to_tensor_Xy(X_train_scaled, y_train_scaled.flatten())  # to_tensor_Xyで再度整形されるためflatten()
+    X_val_t, y_val_t = to_tensor_Xy(X_val_scaled, y_val_scaled.flatten())
+    X_test_t, y_test_t = to_tensor_Xy(X_test_scaled, y_test_scaled.flatten())
+
+    print(f"ANNモデル入力次元: {X_train_t.shape[1]}")
+
+    return {
+        'X_train_t': X_train_t, 'y_train_t': y_train_t,
+        'X_val_t': X_val_t, 'y_val_t': y_val_t,
+        'X_test_t': X_test_t, 'y_test_t': y_test_t,
+        'feature_names': feature_names,
+        'y_scaler': y_scaler,
+        'X_scaler': X_scaler,
+        'train_idx': train_idx,
+        'val_idx': val_idx,
+        'test_idx': test_idx
+    }
+
+
 # --- ヘルパー: numpy -> torch tensor 変換 ---
 def to_tensor_Xy(X_np, y_np):
     X_t = torch.from_numpy(X_np.astype(np.float32))
@@ -179,76 +379,25 @@ def to_tensor_Xy(X_np, y_np):
     return X_t, y_t
 
 
-def training_loop_ann(n_epochs, optimizer, scheduler, model, loss_fn, X_train, X_test, y_train, y_test, patience=500,
-                      min_delta=1e-5):
-    train_losses = []
-    val_losses = []
-
-    # Early Stopping用の変数を初期化
-    best_loss = float('inf')
-    epochs_no_improve = 0
-
-    for epoch in range(1, n_epochs + 1):
-        # --- 訓練ステップ ---
-        model.train()
-        y_p_train = model(X_train)
-        loss_train = loss_fn(y_p_train, y_train)
-
-        optimizer.zero_grad()
-        loss_train.backward()
-        optimizer.step()
-        scheduler.step()
-
-        # --- 検証ステップ ---
-        model.eval()
-        with torch.no_grad():
-            y_p_test = model(X_test)
-            loss_test = loss_fn(y_p_test, y_test)
-
-        # 結果の記録
-        train_losses.append(loss_train.item())
-        current_val_loss = loss_test.item()
-        val_losses.append(current_val_loss)
-
-        # --- Early Stopping判定 ---
-        if current_val_loss < best_loss - min_delta:
-            # 損失が改善した場合
-            best_loss = current_val_loss
-            epochs_no_improve = 0
-            best_model_state = model.state_dict()
-        else:
-            # 改善しなかった場合
-            epochs_no_improve += 1
-
-        if epochs_no_improve >= patience:
-            print(f"\nEarly Stopping triggered at Epoch {epoch}. Best Loss: {best_loss:.4f}")
-            model.load_state_dict(best_model_state)
-            break
-
-    # Early Stoppingで中断されなかった場合、最後の状態が 'best' となる
-    if epochs_no_improve < patience:
-        # 最後に記録された損失がベストだったとみなし、その時点の重みを保存
-        best_model_state = model.state_dict()
-        model.load_state_dict(best_model_state)
-        print(f"\nTraining finished (max epochs reached). Final Loss: {current_val_loss:.4f}")
-
-    return train_losses, val_losses
-
-
-def train_model_ann(X_train, X_val, y_train, y_val, input_size, title):
-    model = nn.Sequential(OrderedDict([
-        ('hidden1', nn.Linear(input_size, 300)),
+# --- ANN モデル定義と学習処理 ---
+# 1. ANNモデルの定義
+class RegressionANN(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        # 隠れ層の定義
+        self.net = nn.Sequential(OrderedDict([
+        ('hidden1', nn.Linear(input_dim, 300)),
         ('bn1', nn.BatchNorm1d(300)),
         ('act1', nn.ReLU()),
-        ('drop1', nn.Dropout(0.4)),
+        ('drop1', nn.Dropout(0.3)),
         ('hidden2', nn.Linear(300, 200)),
         ('bn2', nn.BatchNorm1d(200)),
         ('act2', nn.ReLU()),
-        ('drop2', nn.Dropout(0.4)),
+        ('drop2', nn.Dropout(0.3)),
         ('hidden3', nn.Linear(200, 100)),
         ('bn3', nn.BatchNorm1d(100)),
         ('act3', nn.ReLU()),
-        ('drop3', nn.Dropout(0.4)),
+        ('drop3', nn.Dropout(0.3)),
         ('hidden4', nn.Linear(100, 50)),
         ('bn4', nn.BatchNorm1d(50)),
         ('act4', nn.ReLU()),
@@ -256,273 +405,413 @@ def train_model_ann(X_train, X_val, y_train, y_val, input_size, title):
         ('output', nn.Linear(50, 1))
     ]))
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.9)
-    loss_fn = nn.MSELoss()
+    def forward(self, x):
+        return self.net(x)
 
-    train_losses, val_losses = training_loop_ann(
-        n_epochs=8000,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        model=model,
-        loss_fn=loss_fn,
-        X_train=X_train,
-        X_test=X_val,
-        y_train=y_train,
-        y_test=y_val,
-        patience=1000,  # 損失が改善しないのを待つエポック数 (例: 1000)
-        min_delta=1e-5  # 改善と見なす最小変化量
-    )
+# 2. ANNモデルの学習と評価
+def train_and_evaluate_ann(prepared_data, epochs=100, lr=1e-3):
+    # データとスケーラーの取り出し
+    X_train_t = prepared_data['X_train_t']
+    y_train_t = prepared_data['y_train_t']
+    X_val_t = prepared_data['X_val_t']
+    y_val_t = prepared_data['y_val_t']
+    X_test_t = prepared_data['X_test_t']
+    y_test_t = prepared_data['y_test_t']
+    y_scaler = prepared_data['y_scaler']
 
+    input_dim = X_train_t.shape[1]
 
-    # ----- 学習曲線プロット -----
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_losses, label='Train Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.title(f'{title} - Training & Validation Loss')
+    # モデルのインスタンス化
+    model = RegressionANN(input_dim)
+
+    # 損失関数 (MSE) と最適化手法 (Adam) の定義
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    # 損失を記録するためのリスト
+    train_losses = []
+    val_losses = []
+
+    # 学習ループ
+    print("\n--- ANNモデル学習を開始 ---")
+    for epoch in range(epochs):
+        model.train()
+
+        # 順伝播
+        outputs = model(X_train_t)
+        loss = criterion(outputs, y_train_t)
+
+        # 逆伝播と最適化
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # 訓練損失を記録
+        train_losses.append(loss.item())
+
+        # 検証データでの評価（スケーリングされた値での評価）
+        model.eval()
+        with torch.no_grad():
+            val_outputs = model(X_val_t)
+            val_loss = criterion(val_outputs, y_val_t)
+
+        # 検証損失を記録
+        val_losses.append(val_loss.item())
+
+        if (epoch + 1) % 10 == 0 or epoch == 1:  # 1回目の損失も表示
+            print(f'Epoch [{epoch + 1}/{epochs}], Train Loss: {loss.item():.6f}, Val Loss: {val_loss.item():.6f}')
+
+    # 2. 学習過程の可視化
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_losses, label='Train Loss (MSE)')
+    plt.plot(val_losses, label='Validation Loss (MSE)')
     plt.xlabel('Epoch')
-    plt.ylabel('MSE Loss')
-    plt.legend()
-    plt.show()
-
-    return model
-
-
-def evaluate_model_ann(model, X_val, y_val, title, sales_max, sales_min):
-    model.eval()
-    with torch.no_grad():
-        y_pred = model(X_val).squeeze().numpy()
-        y_true = y_val.squeeze().numpy()
-
-
-    y_true_orig = y_true * (sales_max - sales_min) + sales_min
-    y_pred_orig = y_pred * (sales_max - sales_min) + sales_min
-    mse = mean_squared_error(y_true_orig, y_pred_orig)
-    rmse = np.sqrt(mse)
-    mae = mean_absolute_error(y_true_orig, y_pred_orig)
-    r2 = r2_score(y_true_orig, y_pred_orig)
-    ''' # 評価指数を元のスケールに戻す
-
-    mse = mean_squared_error(y_true, y_pred)
-    rmse = np.sqrt(mse)
-    mae = mean_absolute_error(y_true, y_pred)
-    r2 = r2_score(y_true, y_pred)
-    '''
-
-    # print(f"\n=== {title} の評価結果 ===")
-    # print(f"RMSE（平均二乗誤差の平方根）: {rmse:.4f}")
-    # print(f"MAE（平均絶対誤差）: {mae:.4f}")
-    # print(f"R²（決定係数）: {r2:.4f}\n")
-
-
-
-    # === 2. 予測値 vs 実測値 ===
-    plt.figure(figsize=(6, 6))
-    plt.scatter(y_true, y_pred, alpha=0.6)
-    min_val, max_val = min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())
-    plt.plot([min_val, max_val], [min_val, max_val], color='red', linestyle='--', label='y=x')
-    plt.title(f'{title}：予測値 vs 実測値')
-    plt.xlabel('Actual')
-    plt.ylabel('Predicted')
+    plt.ylabel('Loss (MSE)')
+    plt.title('ANN Model Learning Curve')
     plt.legend()
     plt.grid(True)
     plt.show()
 
-    return rmse, mae, r2
-'''
-# --- ANN を TimeSeriesSplit で CV 実行 ---
-def run_ann_cv(X, y, tscv, verbose=True):
-    rmse_list, mae_list, r2_list = [], [], []
-    input_size = X.shape[1]
-
-    for fold, (train_idx, test_idx) in enumerate(tscv.split(X), 1):
-        X_train_np, X_test_np = X[train_idx], X[test_idx]
-        y_train_np, y_test_np = y[train_idx], y[test_idx]
-
-        # torch テンソル化
-        X_train_t, y_train_t = to_tensor_Xy(X_train_np, y_train_np)
-        X_val_t, y_val_t = to_tensor_Xy(X_test_np, y_test_np)
-
-        # 学習（train_model_ann を利用）
-        title = f"ANN Fold {fold}"
-        model_ann = train_model_ann(X_train_t, X_val_t, y_train_t, y_val_t, input_size=input_size, title=title)
-
-        # 評価（y_scaler の min/max を渡す）
-        sales_max = y_scaler.data_max_[0]
-        sales_min = y_scaler.data_min_[0]
-        rmse, mae, r2 = evaluate_model_ann(model_ann, X_val_t, y_val_t, title, sales_max, sales_min)
-        rmse_list.append(rmse); mae_list.append(mae); r2_list.append(r2)
-
-        if verbose:
-            print(f"[ANN] Fold {fold} -> RMSE: {rmse:.4f}, MAE: {mae:.4f}, R2: {r2:.4f}")
-
-    print("\n=== ANN CV 結果 ===")
-    print(f"平均 RMSE: {np.mean(rmse_list):.4f} (std {np.std(rmse_list):.4f})")
-    print(f"平均 MAE : {np.mean(mae_list):.4f}")
-    print(f"平均 R2  : {np.mean(r2_list):.4f}")
-    return rmse_list, mae_list, r2_list
-'''
-
-
-
-
-def train_lgb_cv(X, y_raw, n_splits=10):
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    rmses = []
-    for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
-        X_train, X_val = X[train_idx], X[val_idx]
-        y_val_raw = y_raw[val_idx]  # 評価用にオリジナルのターゲット
-
-        y_train = np.log1p(y_raw[train_idx])
-        y_val = np.log1p(y_val_raw)
-
-        scaler = StandardScaler()
-        X_train_s = scaler.fit_transform(X_train)
-        X_val_s = scaler.transform(X_val)
-
-        train_data = lgb.Dataset(X_train_s, label=y_train.ravel())
-        val_data = lgb.Dataset(X_val_s, label=y_val.ravel(), reference=train_data)
-
-        params = {
-            "objective": "regression",
-            "metric": "rmse",
-            "learning_rate": 0.05,
-            "num_leaves": 31,
-            "min_data_in_leaf":50,
-            "feature_fraction":0.8,
-            "bagging_fraction":0.8,
-            "bagging_freq":5,
-            "verbosity": -1
-        }
-
-        evals_result = {}
-        bst = lgb.train(params, train_data, num_boost_round=5000,
-                        callbacks=[lgb.record_evaluation(evals_result),
-                                   lgb.early_stopping(stopping_rounds=100, verbose=False)],
-                        valid_sets=[val_data])
-
-        y_pred_log = bst.predict(X_val_s, num_iteration=bst.best_iteration)
-        y_pred = np.expm1(y_pred_log)  # inverse of log1p
-        mse = mean_squared_error(y_val_raw, y_pred)
-        rmse = np.sqrt(mse)
-        '''if fold == n_splits - 1:
-            plt.figure(figsize=(10, 5))
-
-            # 'valid_0' (検証データ) の 'rmse' をプロット
-            metric = 'rmse'
-            lgb.plot_metric(evals_result, metric=metric, ax=plt.gca())
-
-            plt.title(f'LightGBM Validation RMSE during Boosting (Fold {fold + 1})')
-            plt.xlabel('Boosting Rounds')
-            plt.ylabel(f'Validation {metric.upper()}')
-            plt.grid(True)
-            plt.show()'''
-
-        print(f"Fold {fold + 1} RMSE: {rmse:.4f}")  # Fold のインデックス表示を修正
-        rmses.append(rmse)
-
-    print("CV mean RMSE:", np.mean(rmses))
-    return rmses
-
-
-
-
-
-# ===== PIを利用して特徴量の重要度を可視化 =====
-# --- PFI のための関数 (scikit-learn の permutation_importance を利用するのが一般的ですが、今回は手動で実装) ---
-def calculate_permutation_importance(model, X_val_t, y_val_t, feature_names, sales_max, sales_min,
-                                     loss_fn=mean_squared_error):
+    # 3. テストデータでの評価
     model.eval()
-
-    # 1. ベースラインのスコアを取得 (シャッフルなし)
     with torch.no_grad():
-        y_pred_base = model(X_val_t).squeeze().numpy()
-        y_true = y_val_t.squeeze().numpy()
+        y_pred_scaled_t = model(X_test_t)
 
-    # スケールを元に戻す
-    y_true_orig = y_true * (sales_max - sales_min) + sales_min
-    y_pred_base_orig = y_pred_base * (sales_max - sales_min) + sales_min
-    base_score = loss_fn(y_true_orig, y_pred_base_orig)
+    # 4. スケールを元に戻す (Inverse Transform)
+    y_pred_scaled_np = y_pred_scaled_t.numpy()
+    y_test_scaled_np = y_test_t.numpy()
 
-    importance = {}
-    X_val_np = X_val_t.numpy()
+    # スケーラーを使って予測値と実測値を元のスケールに戻す
+    y_pred = y_scaler.inverse_transform(y_pred_scaled_np)
+    y_true = y_scaler.inverse_transform(y_test_scaled_np)
 
-    # 2. 各特徴量を順番にシャッフル
-    for i, name in enumerate(feature_names):
-        # 元のテンソルをコピー
-        X_shuffled_np = X_val_np.copy()
+    # 5. 評価指標の計算 (元のスケールで評価)
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2 = r2_score(y_true, y_pred)
 
-        # i番目の特徴量だけをシャッフル
-        X_shuffled_np[:, i] = np.random.permutation(X_shuffled_np[:, i])
+    print("\n--- テストデータ評価 (元のスケール) ---")
+    print(f"Mean Absolute Error (MAE): {mae:.2f}")
+    print(f"Root Mean Squared Error (RMSE): {rmse:.2f}")
+    print(f"R-squared (R2): {r2:.4f}")
 
-        # シャッフルしたテンソルで予測
-        X_shuffled_t = torch.from_numpy(X_shuffled_np.astype(np.float32))
+    return y_true, y_pred, model
 
+
+# --- 特徴量重要度分析の実行(PI) ---
+def feature_importance_analysis(model, prepared_data, y_true, y_pred):
+    X_test_t = prepared_data['X_test_t']
+    feature_names = prepared_data['feature_names']
+
+    # -----------------------------------------------------------
+    # Permutation Importance (PI) の計算
+    # -----------------------------------------------------------
+
+    # PI はモデルの予測精度 (MSE) の変化を見るため、元のスケールで評価します。
+    # 目的変数スケーラー (y_scaler) を使って、予測関数を定義する必要があります。
+    y_scaler = prepared_data['y_scaler']
+
+    # モデルの予測を元のスケールに戻す関数
+    def predict_unscaled(model, X_tensor):
+        model.eval()
         with torch.no_grad():
-            y_pred_shuffled = model(X_shuffled_t).squeeze().numpy()
+            # 予測結果 (Scaled)
+            y_pred_scaled = model(X_tensor).numpy()
+            # 予測結果を元のスケールに戻す
+            y_pred_unscaled = y_scaler.inverse_transform(y_pred_scaled)
+            return y_pred_unscaled.flatten()
 
-        # スケールを元に戻してスコア計算
-        y_pred_shuffled_orig = y_pred_shuffled * (sales_max - sales_min) + sales_min
-        shuffled_score = loss_fn(y_true_orig, y_pred_shuffled_orig)
+    # テストデータのNumpy配列 (Scaled)
+    X_test_np = X_test_t.numpy()
 
-        # 重要度: (シャッフル後のスコア - ベースラインスコア) / ベースラインスコア
-        # RMSEベースで計算
-        importance[name] = (np.sqrt(shuffled_score) - np.sqrt(base_score)) / np.sqrt(base_score)
+    # PI計算のための損失関数 (ここでは Mean Squared Error を使用)
+    def mse_loss(y_true, y_pred):
+        return mean_squared_error(y_true, y_pred)
 
-    return importance, base_score
+    # Permutation Importance の計算
+    # 訓練済みモデルとテストデータセット（Numpy）を使用
+    print("\n--- 1. Permutation Importance (PI) の計算 ---")
+
+    # ベースラインスコア (シャッフルなし)
+    baseline_pred = predict_unscaled(model, X_test_t)
+    baseline_score = mse_loss(y_true, baseline_pred)
+    print(f"ベースライン MSE (シャッフルなし): {baseline_score:.2f}")
+
+    pi_scores = {}
+
+    for i, name in enumerate(feature_names):
+        # i番目の特徴量をシャッフル
+        X_test_shuffled = X_test_np.copy()
+        X_test_shuffled[:, i] = np.random.permutation(X_test_shuffled[:, i])
+
+        # シャッフル後の予測
+        X_shuffled_t = torch.from_numpy(X_test_shuffled).float()
+        shuffled_pred = predict_unscaled(model, X_shuffled_t)
+
+        # 損失の増加
+        shuffled_score = mse_loss(y_true, shuffled_pred)
+        pi_scores[name] = shuffled_score - baseline_score
+
+    # 結果をDataFrameに格納し、ソート
+    pi_df = pd.DataFrame(list(pi_scores.items()), columns=['Feature', 'Importance (MSE Increase)'])
+    pi_df = pi_df.sort_values(by='Importance (MSE Increase)', ascending=False).reset_index(drop=True)
+
+    # 可視化
+    plt.figure(figsize=(12, pi_df.shape[0] * 0.3))
+    plt.barh(pi_df['Feature'], pi_df['Importance (MSE Increase)'])
+    plt.xlabel('Importance (Increase in MSE after permutation)')
+    plt.title('Permutation Importance')
+    plt.gca().invert_yaxis()
+    plt.tight_layout()
+    plt.show()
+
+    '''# -----------------------------------------------------------
+    # 2. SHAP (SHapley Additive exPlanations) の計算と可視化
+    # -----------------------------------------------------------
+
+    # SHAPを計算するためのライブラリをインポート
+    import shap
+
+    print("\n--- 2. SHAP (SHapley Additive exPlanations) の計算 ---")
+
+    # 背景データとして訓練データの一部を使用 (計算コスト削減のため)
+    X_train_np = prepared_data['X_train_t'].numpy()
+    background = X_train_np[np.random.choice(X_train_np.shape[0], 100, replace=False)]
+
+    # DeepExplainer の使用（ニューラルネットワーク向け）
+    explainer = shap.DeepExplainer(model, torch.from_numpy(background).float())
+
+    # テストデータに対するSHAP値の計算 (注意: 時間がかかる場合があります)
+    shap_values = explainer.shap_values(X_test_t)
+
+    # SHAP要約プロット (全体的な特徴量の重要度)
+    print("\nSHAP Summary Plot (特徴量の全体的な影響度)")
+    # 特徴量名をNumPy配列に変換して渡す
+    shap.summary_plot(shap_values, X_test_np, feature_names=feature_names)
+    '''
+    return pi_df
 
 
+# --- Uplift Modeling (広告効果) の可視化 ---
+# --- Individual Uplift Score の計算 ---
+def calculate_individual_uplift(model, prepared_data):
+    X_test_t = prepared_data['X_test_t']
+    feature_names = prepared_data['feature_names']
+    y_scaler = prepared_data['y_scaler']
+    X_scaler = prepared_data['X_scaler']
+
+    # '広告_有無' の特徴量インデックスを取得
+    try:
+        ad_col_index = feature_names.index('広告_有無')
+    except ValueError:
+        print("エラー: '広告_有無' 列が特徴量リストに見つかりません。Uplift計算をスキップします。")
+        return None, None, None
+
+    # Standard Scaler を使用して、元の値 0 と 1 が scaled 空間で何になるかを計算
+    ad_mean = X_scaler.mean_[ad_col_index]
+    ad_std = X_scaler.scale_[ad_col_index]
+
+    scaled_ad_off = (0 - ad_mean) / ad_std
+    scaled_ad_on = (1 - ad_mean) / ad_std
+
+    print(f"\n--- S-Learner Individual Uplift 計算 ---")
+    print(f"'広告_有無'=0 の Scaled 値: {scaled_ad_off:.4f}")
+    print(f"'広告_有無'=1 の Scaled 値: {scaled_ad_on:.4f}")
+
+    # 2. MT (Treatment) と MC (Control) の予測
+    model.eval()
+    with torch.no_grad():
+        # --- MC (Control: 広告_有無=0) の予測 ---
+        X_C_t = X_test_t.clone()
+        X_C_t[:, ad_col_index] = scaled_ad_off  # 全サンプルで '広告_有無' を 0 に強制
+        M_C_scaled_t = model(X_C_t)
+
+        # --- MT (Treatment: 広告_有無=1) の予測 ---
+        X_T_t = X_test_t.clone()
+        X_T_t[:, ad_col_index] = scaled_ad_on  # 全サンプルで '広告_有無' を 1 に強制
+        M_T_scaled_t = model(X_T_t)
+
+    # 3. Inverse Transform と Uplift 計算
+    M_C = y_scaler.inverse_transform(M_C_scaled_t.numpy()).flatten()
+    M_T = y_scaler.inverse_transform(M_T_scaled_t.numpy()).flatten()
+
+    # Individual Uplift Score の計算
+    individual_uplift = M_T - M_C
+
+    print(f"Individual Uplift Score の計算が完了しました。平均 Uplift: {individual_uplift.mean():.2f}")
+
+    return M_C, M_T, individual_uplift
+
+# --- Uplift Modeling (広告効果) の可視化 (Individual Uplift対応) ---
+def uplift_visualization(M_C, individual_uplift):
+    print(f"\n--- Individual Uplift Visualization を開始 ---")
+
+    # -----------------------------------------------------------
+    # 1. 予測 Uplift のヒストグラム (横軸: Uplift, Uplift=0 に赤線)
+    # -----------------------------------------------------------
+
+    plt.figure(figsize=(10, 6))
+
+    # Uplift の分布
+    plt.hist(individual_uplift, bins=30, alpha=0.8, color='purple', label='Individual Uplift Score')
+
+    # Uplift = 0 の位置に赤い線を追加
+    plt.axvline(0, color='red', linestyle='dashed', linewidth=2, label='Uplift = 0')
+
+    plt.title('Individual Uplift Score の分布')
+    plt.xlabel('Uplift (MT_pred - MC_pred)')
+    plt.ylabel('度数')
+    plt.legend()
+    plt.grid(axis='y', linestyle='--')
+    plt.show()
+
+    # -----------------------------------------------------------
+    # 2. 散布図 (横軸: M_C, 縦軸: Uplift = M_T - M_C, 4象限)
+    # -----------------------------------------------------------
+
+    mc_avg = M_C.mean()
+
+    plt.figure(figsize=(10, 6))
+
+    # 散布図のプロット (全テストサンプル)
+    plt.scatter(M_C, individual_uplift, alpha=0.6, s=30, color='blue')
+
+    # Uplift = 0 の赤い線を引く (横線)
+    plt.axhline(0, color='red', linestyle='-', linewidth=2, label='Uplift = 0')
+
+    # MC_avg の点線 (縦線)
+    plt.axvline(mc_avg, color='gray', linestyle='--', linewidth=1, label=f'MC_avg={mc_avg:.2f}')
+
+    # 4象限の名称をテキストで追加
+    y_max = individual_uplift.max() * 0.95
+    y_min = individual_uplift.min() * 0.95
+
+    # Persuadables (説得可能層) - 広告を打つべき層
+    plt.text(M_C.min(), y_max, 'Persuadables',
+             verticalalignment='top', horizontalalignment='left', color='green', fontsize=12, weight='bold')
+    # Sure Things (当然買う層) - 広告不要
+    plt.text(mc_avg, y_max, 'Sure Things',
+             verticalalignment='top', horizontalalignment='left', color='darkorange', fontsize=12, weight='bold')
+    # Sleepers (休眠層) - 広告不要
+    plt.text(mc_avg, y_min, 'Sleepers',
+             verticalalignment='bottom', horizontalalignment='left', color='purple', fontsize=12, weight='bold')
+    # Lost Causes (見込み薄層) - 広告無駄
+    plt.text(M_C.min(), y_min, 'Lost Causes',
+             verticalalignment='bottom', horizontalalignment='left', color='red', fontsize=12, weight='bold')
+
+    plt.title('Individual Uplift Score vs Control Prediction ($M_C$ での4象限)')
+    plt.xlabel('予測売上 $M_C$ (広告なしの場合)')
+    plt.ylabel('Individual Uplift ($M_T - M_C$)')
+    plt.legend()
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.show()
 
 
-
-
-# ===== uplift 分析（広告の有無で比較） =====
-def uplift_by_ad(df, target_col="売上数", ad_lag_col="広告_有無"):
+def analyze_uplift_segments(
+        M_C: np.ndarray,
+        individual_uplift: np.ndarray,
+        prepared_data: Dict[str, Any],
+        top_pi_features: list,
+        uplift_threshold: float = 0.0,
+        # mc_threshold: float = M_C.mean()
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    広告有（Treatment）/ 無（Control）で uplift を算出し、結果を整形して表示する。
+    個別Upliftスコアに基づきデータをセグメント化し、主要な特徴量の平均値を比較する。
 
-    Args:
-        df: 前処理済みデータ ('name', ターゲット列, 広告有無ラグ列を含む)
-        target_col: uplift を計算する目的変数（例: '売上数', '売上高'）
-        ad_lag_col: 広告の有無を示すバイナリ列（例: '広告_有無_lag3'）
-
-    Returns:
-        pd.Series: 商品別 uplift 値
+    PIで上位の特徴量をキーとして比較する。
     """
-    print(f"\n ====== {target_col} への広告効果 (Uplift) 分析 ====== ")
 
-    # 1. 全体 uplift の計算
-    treat = df[df[ad_lag_col] == 1][target_col].mean()
-    control = df[df[ad_lag_col] == 0][target_col].mean()
-    uplift = treat - control
+    print("\n--- Uplift セグメント別 特徴量分析を開始 ---")
 
-    print("\n---  全体 Uplift (平均売上数の増分) ---")
-    print(f"   広告あり (Treatment) 平均: {treat:,.2f}")
-    print(f"   広告なし (Control)   平均: {control:,.2f}")
-    print(f"   **Uplift（広告効果）**: {uplift:,.2f} （{target_col} の増分）")
+    # 1. データの復元と結合 (変更なし)
+    X_test_scaled = prepared_data['X_test_t'].numpy()
+    X_scaler = prepared_data['X_scaler']
+    feature_names = prepared_data['feature_names']
 
-    # 2. 商品別 uplift の計算
-    # name ごとにグループ化し、(広告あり平均 - 広告なし平均) を計算
-    uplift_result = (
-        df.groupby("name")
-        .apply(lambda g: g[g[ad_lag_col] == 1][target_col].mean()
-                         - g[g[ad_lag_col] == 0][target_col].mean())
-        .sort_values(ascending=False)
-        .rename("Uplift")
+    X_test_original = X_scaler.inverse_transform(X_test_scaled)
+    df_results = pd.DataFrame(X_test_original, columns=feature_names)
+
+    df_results['M_C'] = M_C
+    df_results['Individual_Uplift'] = individual_uplift
+
+    # 2. セグメントの定義と分類 (変更なし)
+    PERSUADABLES_CONDITION = (df_results['Individual_Uplift'] > uplift_threshold) & \
+                             (df_results['M_C'] <= M_C.mean())
+    LOST_SLEEPERS_CONDITION = (df_results['Individual_Uplift'] <= 0)
+
+    df_persuadables = df_results[PERSUADABLES_CONDITION].copy()
+    df_lost_sleepers = df_results[LOST_SLEEPERS_CONDITION].copy()
+
+    segment_counts = {
+        'Persuadables': len(df_persuadables),
+        'Sleepers/Lost Causes': len(df_lost_sleepers),
+        'Overall Test Set': len(df_results)
+    }
+    df_segment_counts = pd.DataFrame(
+        list(segment_counts.items()), columns=['Segment', 'Count']
     )
+    print(df_segment_counts.to_markdown(index=False))
 
-    print("\n---  商品別 Uplift Top 5 ---")
-    print(uplift_result.head(5).to_string(float_format='{:,.2f}'.format))
+    if df_persuadables.empty or df_lost_sleepers.empty:
+        print("エラー: 比較に必要なサンプルが不足しています。セグメントの閾値を確認してください。")
+        return pd.DataFrame(), df_segment_counts
 
-    print("\n--- 📉 商品別 Uplift Bottom 5 (効果が低い・マイナス) ---")
-    print(uplift_result.tail(5).to_string(float_format='{:,.2f}'.format))
+    # 3. 特徴量比較の構築
+    # PI上位特徴量に、広告・相互作用・連続広告特徴量を統合
+    # BERT特徴量は少なくとも一つ含める (例: bert_reduced_0)
+    essential_features = [
+        '広告_有無_連続',
+        'Interaction_店頭在庫数_広告',
+        'Interaction_客数_広告',
+        'bert_reduced_0'
+    ]
 
-    return uplift_result
+    # PI上位特徴量と必須特徴量を結合し、重複を削除
+    key_features = list(set(top_pi_features + essential_features))
+    # '広告_有無' は Uplift 計算の基であるため除外する (結果の解釈を容易にするため)
+    if '広告_有無' in key_features:
+        key_features.remove('広告_有無')
+
+    key_features = [f for f in key_features if f in df_results.columns]
+
+    print(f"\n--- 比較対象の動的 key_features ({len(key_features)}個) ---")
+    print(key_features)
+
+    segments = {
+        'Persuadables': df_persuadables,
+        'Sleepers/Lost Causes': df_lost_sleepers,
+        'Overall Test Set': df_results
+    }
+
+    comparison_data = []
+
+    for feature in key_features:
+        row = {'Feature': feature}
+        for name, df in segments.items():
+            mean_val = df[feature].mean()
+            std_val = df[feature].std()
+
+            # 数値の整形ロジック (変更なし)
+            if feature.startswith('bert_reduced'):
+                mean_str = f"{mean_val:.3f}"
+                std_str = f"({std_val:.3f})"
+            elif feature in ['当店在庫手持週', '客数', '広告_有無_連続']:
+                mean_str = f"{mean_val:.1f}"
+                std_str = f"({std_val:.1f})"
+            else:
+                mean_str = f"{mean_val:.0f}"
+                std_str = f"({std_val:.0f})"
+
+            row[f'{name} (Mean)'] = mean_str
+            row[f'{name} (Std)'] = std_str
+        comparison_data.append(row)
+
+    df_comparison = pd.DataFrame(comparison_data)
+
+    return df_comparison, df_segment_counts
 
 
-
-
-
+# ======================================================================================================================
 
 
 pd.set_option('display.max_columns', None)  # すべての列を表示
@@ -533,526 +822,54 @@ retail = pd.read_excel('C:/Users/23X4002/Desktop/3年生秋/PBL/需要予測(広
 weather= pd.read_csv('C:/Users/23X4002/Desktop/3年生秋/PBL/需要予測(広告)/気象データ03.csv',
                      encoding='cp932', skiprows=3)
 
-
 data_mm = preprocess(retail, weather)
-
-
-
-
-
-# ===== nameの特徴量作成 =====
-data_api = data_mm.copy()
-# data_api["bert_vec"] = data_api["name"].apply(bert_features)
-data_api["bert_vec"] = list(bert_features_batch(data_api["name"].tolist(), layer=8))
-
-
-
-
-
-
-# ===== 正規化 =====
-y_scaler = MinMaxScaler()
-y_scaler.fit(data_api[['売上数']])
-# # --- デバッグ情報 (data_api を使用) ---
-# print("\n--- データ (data_api) のヘッダー ---")
-# print(data_api.head(3))
-# print("\n--- データ (data_api) の概要 ---")
-# print(data_api.describe())
-# print("\n--- データ (data_api) の情報 ---")
-# print(data_api.info())
-
-
-
-
-
-#===== bert特徴量の次元削除 =====
-X_bert = np.vstack(data_api["bert_vec"].values)  # shape: (n_samples, 768)
-scaler_pca = StandardScaler()
-X_bert_scaled = scaler_pca.fit_transform(X_bert)
-
-# PCAの実行（全次元）
-pca = PCA(n_components=None) # n_components=None で全次元を計算
-pca.fit(X_bert_scaled)
-
-# 累積寄与率の計算とプロット
-cumulative_variance = np.cumsum(pca.explained_variance_ratio_)
-
-'''plt.figure(figsize=(10, 5))
-plt.plot(cumulative_variance)
-plt.title('累積寄与率の推移')
-plt.xlabel('主成分の数')
-plt.ylabel('累積寄与率')
-plt.grid(True)
-# 例: 寄与率95%のラインを引く
-plt.axhline(0.95, color='red', linestyle='--', label='95%')
-plt.legend()
-plt.show()'''
-
-# 95%の寄与率を達成する主成分数kを決定
-k = np.where(cumulative_variance >= 0.95)[0][0] + 1
-print(f"累積寄与率 95% を達成する主成分の数 k: {k}")
-
-# 決定した k 次元に削減
-pca_final = PCA(n_components=k)
-X_bert_pca = pca_final.fit_transform(X_bert_scaled)
-
-print(f"削減後のBERT特徴量の形状: {X_bert_pca.shape}")
-
-
-
-
-
-# ===== 特徴量の選択 =====
-# select_cols = ['客数', '売上数_rollmean_prev3', '店頭在庫数', '当店在庫手持週', 'name_【2辛】素材を生かしたカレー 6代目バターチキン',
-#                'name_【3辛】焙煎スパイスのごろり牛肉カレー', '日照時間(時間)', 'name_【4辛】素材を生かした牛ばら肉の大盛カレー', '降水量の合計(mm)', 'name_【5辛】素材を生かしたカレー グリーン',
-#                'yday_sin', '平均気温(℃)', '平均風速(m/s)', '納入予定数', 'yday_cos',
-#                '広告_有無_lag2']
-exclude_cols = ['name', '売上数', '売上高','日付',# '広告_有無','広告_有無_lag1', '広告_有無_lag3',
-                'Interaction_納入予定数_広告', 'Interaction_客数_広告', 'Interaction_price_広告', 'Interaction_店頭在庫数_広告', 'Interaction_在庫手持週_広告',
-                "bert_vec"]
-target = '売上数'
-X_num_df = data_api.drop(columns=exclude_cols, errors='ignore')
-X_num = X_num_df.values
-# ターゲット変数
-y_unscaled = data_api[target].values.reshape(-1, 1) # スケーリング前のターゲット
-y = y_scaler.transform(y_unscaled) # スケーリング
-
-X = np.hstack([X_num, X_bert_pca]) # bert特徴量をk次元に圧縮
-# X = np.hstack([X_num, X_bert_scaled])
-print(f"\n最終的な特徴量 X の形状 (PCA適用後): {X.shape}, ターゲット y の形状: {y.shape}")
-# X_num_df の列名を確認 (デバッグ用)
-# print("X_num の列:")
-# print(X_num_df.columns.tolist())
-
-
-
-
-
-
-# ===== ANNの実装 =====
-tscv = TimeSeriesSplit(n_splits=30)
-print("Start ANN CV ...")
-lgbm_rmses_list = train_lgb_cv(X, y_unscaled)
-
-
-
-
-
-
-
-# --- PFI 実行部分 ---
-# 最終的な特徴量の列名リストを作成
-num_feature_names = X_num_df.columns.tolist()
-# BERTベクトルは768次元あるため、個別の列名を付ける
-bert_feature_names = [f"bert_vec_{i}" for i in range(X_bert_pca.shape[1])]
-all_feature_names = num_feature_names + bert_feature_names
-
-# CV の最終 Fold のデータで再学習・評価
-final_train_idx, final_test_idx = list(tscv.split(X))[-1]
-X_train_np, X_test_np = X[final_train_idx], X[final_test_idx]
-y_train_np, y_test_np = y[final_train_idx], y[final_test_idx]
-
-X_train_t, y_train_t = to_tensor_Xy(X_train_np, y_train_np)
-X_val_t, y_val_t = to_tensor_Xy(X_test_np, y_test_np)
-
-print("\n--- Final Model Training for PFI ---")
-final_model = train_model_ann(X_train_t, X_val_t, y_train_t, y_val_t,
-                              input_size=X.shape[1], title="Final Model")
-
-sales_max = y_scaler.data_max_[0]
-sales_min = y_scaler.data_min_[0]
-
-# PFI の計算（ここでは簡略化のため MSE を使用、評価関数に合わせて RMSE を計算）
-importance_results, base_mse = calculate_permutation_importance(
-    final_model,
-    X_val_t,
-    y_val_t,
-    all_feature_names,
-    sales_max,
-    sales_min,
-    loss_fn=mean_squared_error
-)
-
-# 結果を DataFrame にしてソート
-importance_df = pd.DataFrame(
-    list(importance_results.items()),
-    columns=['Feature', 'Importance (RMSE increase %)']
-).sort_values(by='Importance (RMSE increase %)', ascending=False)
-
-print("\n=== Permutation Feature Importance Top 30 ===")
-print(importance_df.head(30))
-
-# --- 可視化 ---
-plt.figure(figsize=(10, 6))
-top_n = 20
-df_plot = importance_df.head(top_n).sort_values(by='Importance (RMSE increase %)', ascending=True)
-plt.barh(df_plot['Feature'], df_plot['Importance (RMSE increase %)'])
-plt.title(f'Top {top_n} Feature Importance (Permutation)')
-plt.xlabel('RMSE Increase Ratio')
-plt.ylabel('Feature')
-plt.grid(axis='x', linestyle='--')
-plt.tight_layout()
-plt.show()
-
-
-
-
-
-# ===== uplift modeling =====
-uplift_result = uplift_by_ad(data_api)
-# --- 統計情報の表示 (オプション) ---
-print("\n=== 商品別 Uplift の統計情報 ===")
-print(uplift_result.describe().to_string(float_format='{:,.2f}'.format))
-
-
-ad_col = '広告_有無'
-
-# --- Treatment/Control データを作成 ---
-X_test_treat_np = X_test_np.copy()
-X_test_ctrl_np = X_test_np.copy()
-
-ad_idx = all_feature_names.index(ad_col)
-print(f"Treatment Indicator: {ad_col} (Index: {ad_idx})")
-
-
-def run_two_model_uplift_cv(X, y_raw, all_feature_names, n_splits=5):
-    """
-    Two-Model Approach を実行し、Upliftの平均RMSEを計算する。
-
-    Args:
-        X (np.ndarray): 全特徴量配列。
-        y_raw (np.ndarray): スケーリングされていないターゲット変数 (売上数)。
-        all_feature_names (list): Xの列名リスト。
-        n_splits (int): TimeSeriesSplitの分割数。
-
-    Returns:
-        tuple: (cv_rmses_mt, cv_rmses_mc, final_uplifts, final_y_pred_treat)
-    """
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    cv_rmses_mt, cv_rmses_mc = [], []
-    final_uplifts, final_y_pred_treat = None, None
-
-    # T-Learnerでは広告有無を特徴量から削除しない
-    X_df = pd.DataFrame(X, columns=all_feature_names)
-    X_train_df = X_df.copy() # 初期化
-
-    for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
-        # データの分割
-        X_train_np, X_val_np = X[train_idx], X[val_idx]
-        y_train_raw, y_val_raw = y_raw[train_idx], y_raw[val_idx]
-
-        # 広告有無に基づきデータをサブセット化
-        ad_train = X_train_np[:, ad_idx]
-        ad_val = X_val_np[:, ad_idx] # 検証データは両モデルの評価に使用
-
-        # Treatment (T=1) と Control (T=0) の学習データ
-        X_train_t = X_train_np[ad_train == 1]
-        y_train_t = np.log1p(y_train_raw[ad_train == 1])
-
-        X_train_c = X_train_np[ad_train == 0]
-        y_train_c = np.log1p(y_train_raw[ad_train == 0])
-
-        # LightGBMパラメータ (調整可能)
-        params = {
-            "objective": "regression", "metric": "rmse", "learning_rate": 0.05,
-            "num_leaves": 31, "min_data_in_leaf": 50, "verbosity": -1
-        }
-
-        # 特徴量のスケーリング (各フォールドで再フィット)
-        scaler = StandardScaler()
-        X_train_t_s = scaler.fit_transform(X_train_t)
-        X_train_c_s = scaler.fit_transform(X_train_c) # ControlモデルはControlデータでスケーリング
-        X_val_s = scaler.fit_transform(X_val_np) # 検証データもこのスケーラーを使用
-
-        # 1. Treatment Model (M_T) の学習
-        bst_t = lgb.LGBMRegressor(**params, n_estimators=5000)
-        bst_t.fit(X_train_t_s, y_train_t.ravel())
-
-        # 2. Control Model (M_C) の学習
-        bst_c = lgb.LGBMRegressor(**params, n_estimators=5000)
-        bst_c.fit(X_train_c_s, y_train_c.ravel())
-
-        # 3. 検証データでの予測とRMSE計算
-        # M_T の予測 (y_pred_t): T=1 のデータに M_T を適用
-        # M_C の予測 (y_pred_c): T=0 のデータに M_C を適用
-        y_pred_t_log = bst_t.predict(X_val_s)
-        y_pred_c_log = bst_c.predict(X_val_s)
-
-        y_pred_t = np.expm1(y_pred_t_log)
-        y_pred_c = np.expm1(y_pred_c_log)
-
-        # M_TのRMSE (T=1の検証データのみで評価)
-        y_val_t_raw = y_val_raw[ad_val == 1]
-        y_pred_t_val_subset = y_pred_t[ad_val == 1]
-        rmse_t = np.sqrt(mean_squared_error(y_val_t_raw, y_pred_t_val_subset))
-
-        # M_CのRMSE (T=0の検証データのみで評価)
-        y_val_c_raw = y_val_raw[ad_val == 0]
-        y_pred_c_val_subset = y_pred_c[ad_val == 0]
-        rmse_c = np.sqrt(mean_squared_error(y_val_c_raw, y_pred_c_val_subset))
-
-        cv_rmses_mt.append(rmse_t)
-        cv_rmses_mc.append(rmse_c)
-
-        print(f"Fold {fold + 1} - RMSE (M_T): {rmse_t:.4f}, RMSE (M_C): {rmse_c:.4f}")
-
-        # 最終フォールドの結果を保存
-        if fold == n_splits - 1:
-            # Uplift = M_Tの予測 - M_Cの予測
-            final_uplifts = y_pred_t - y_pred_c
-            final_y_pred_treat = y_pred_t
-            final_y_pred_control = y_pred_c
-            final_X_val = X_val_np
-            # 広告有無の特徴量を Uplift に使用するラグに戻す (データのインデックスが複雑なためここでは省略)
-            # Uplift の分布可視化は後で行います
-
-    print("\n=== Two-Model CV 結果 ===")
-    print(f"M_T (Treatment) の平均 RMSE: {np.mean(cv_rmses_mt):.4f} (std {np.std(cv_rmses_mt):.4f})")
-    print(f"M_C (Control) の平均 RMSE: {np.mean(cv_rmses_mc):.4f} (std {np.std(cv_rmses_mc):.4f})")
-
-    return final_uplifts, final_y_pred_treat, final_y_pred_control, final_X_val
-'''
-
-def run_two_model_uplift_cv_ann(X, y_raw, all_feature_names, y_scaler, n_splits=5):
-    """
-    Two-Model Approach (T-Learner) をANNモデルで実行し、Upliftを計算する。
-
-    Args:
-        X (np.ndarray): 全特徴量配列。
-        y_raw (np.ndarray): スケーリングされていないターゲット変数 (売上数)。
-        all_feature_names (list): Xの列名リスト。
-        y_scaler (MinMaxScaler): y_raw のスケーリングに使用したMinMaxScalerオブジェクト。
-        n_splits (int): TimeSeriesSplitの分割数。
-
-    Returns:
-        tuple: (final_uplifts, final_y_pred_control)
-    """
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    ad_col = '広告_有無_lag3'  # 適切な広告有無の特徴量に変更してください
-    ad_idx = all_feature_names.index(ad_col)
-    input_size = X.shape[1]
-
-    final_uplifts, final_y_pred_treat, final_y_pred_control, final_X_val = None, None, None, None
-    sales_max = y_scaler.data_max_[0]
-    sales_min = y_scaler.data_min_[0]
-
-    for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
-        print(f"\n--- Fold {fold + 1} / {n_splits} ---")
-
-        X_train_np, X_val_np = X[train_idx], X[val_idx]
-        y_train_raw, y_val_raw = y_raw[train_idx], y_raw[val_idx]
-
-        # ターゲットのスケーリング
-        y_train_scaled = y_scaler.transform(y_train_raw)
-        y_val_scaled = y_scaler.transform(y_val_raw)
-
-        ad_train = X_train_np[:, ad_idx]
-
-        # データのサブセット化
-        X_train_t_np = X_train_np[ad_train == 1]
-        y_train_t_scaled = y_train_scaled[ad_train == 1]
-
-        X_train_c_np = X_train_np[ad_train == 0]
-        y_train_c_scaled = y_train_scaled[ad_train == 0]
-
-        # PyTorch テンソル化
-        X_train_t, y_train_t = to_tensor_Xy(X_train_t_np, y_train_t_scaled)
-        X_train_c, y_train_c = to_tensor_Xy(X_train_c_np, y_train_c_scaled)
-        X_val_t, _ = to_tensor_Xy(X_val_np, y_val_scaled)  # y_val は評価に使わない
-
-        # 1. Treatment Model (M_T) の学習
-        print("Training Treatment Model (M_T)...")
-        model_t = train_model_ann(X_train_t, X_val_t, y_train_t, X_val_t,
-                                  input_size=input_size, title=f"M_T Fold {fold + 1}")  # X_val_t を渡して検証
-
-        # 2. Control Model (M_C) の学習
-        print("Training Control Model (M_C)...")
-        model_c = train_model_ann(X_train_c, X_val_t, y_train_c, X_val_t,
-                                  input_size=input_size, title=f"M_C Fold {fold + 1}")  # X_val_t を渡して検証
-
-        # 3. 検証データでの予測
-        model_t.eval();
-        model_c.eval()
-        with torch.no_grad():
-            y_pred_t_scaled = model_t(X_val_t).squeeze().numpy()
-            y_pred_c_scaled = model_c(X_val_t).squeeze().numpy()
-
-        # 予測値を元のスケールに戻す (逆変換)
-        y_pred_t = y_pred_t_scaled * (sales_max - sales_min) + sales_min
-        y_pred_c = y_pred_c_scaled * (sales_max - sales_min) + sales_min
-
-        # 4. Uplift の計算
-        uplifts = y_pred_t - y_pred_c
-
-        print(f"Fold {fold + 1} - Predicted Uplift Mean: {np.mean(uplifts):.2f}")
-
-        # 最終フォールドの結果を保存
-        if fold == n_splits - 1:
-            final_uplifts = uplifts
-            final_y_pred_treat = y_pred_t
-            final_y_pred_control = y_pred_c
-            final_X_val = X_val_np
-
-    return final_uplifts, final_y_pred_control, final_X_val
-
-
-# --- 実行 ---
-final_uplifts, final_y_pred_control, final_X_val = run_two_model_uplift_cv_ann(
-    X, y_unscaled, all_feature_names, y_scaler, n_splits=5
-)'''
-
-# --- 実行 ---
-final_uplifts, final_y_pred_treat, final_y_pred_control, final_X_val = run_two_model_uplift_cv(
-    X, y_unscaled, all_feature_names, n_splits=5
-)
-
-# Uplift のセグメント分類と可視化
-def plot_uplift_quadrant(uplift_values, control_predictions):
-    """
-    UpliftとControl予測値に基づき、4象限散布図をプロットする。
-
-    Args:
-        uplift_values (np.ndarray): 予測された Uplift 値 (T - C)。
-        control_predictions (np.ndarray): 予測された Control 売上値 (M_C(X))。
-    """
-    plt.figure(figsize=(10, 8))
-
-    # 象限の閾値 (例: 0 or 平均)
-    uplift_mean = np.mean(uplift_values)
-    control_mean = np.mean(control_predictions)
-
-    # データの散布
-    plt.scatter(control_predictions, uplift_values, alpha=0.6, s=20)
-
-    # 象限分割線
-    plt.axhline(0, color='red', linestyle='-', linewidth=0.8, label='Uplift = 0') # 広告効果の分岐点
-    plt.axvline(control_mean, color='gray', linestyle='--', linewidth=0.8, label=f'Control Mean ({control_mean:.1f})')
-
-    # 象限名の追加
-    # 右上: Sure Things (M_Cが高い & Uplift > 0)
-    plt.text(control_mean * 1.05, uplift_mean * 1.5, "Sure Things\n(高売上, 広告不要)", color='blue', fontsize=12, ha='left')
-    # 左上: Persuadables (M_Cが低い & Uplift > 0)
-    plt.text(control_mean * 0.95, uplift_mean * 1.5, "Persuadables\n(低売上, 広告効く)", color='green', fontsize=12, ha='right')
-    # 左下: Lost Causes (M_Cが低い & Uplift < 0)
-    plt.text(control_mean * 0.95, -uplift_mean * 0.5, "Lost Causes\n(低売上, 広告効かない)", color='orange', fontsize=12, ha='right')
-    # 右下: Treated Negatives (M_Cが高い & Uplift < 0) - Uplift < 0 のデータが少ない場合は調整
-    plt.text(control_mean * 1.05, -uplift_mean * 0.5, "Treated Negatives\n(高売上, 広告が逆効果)", color='purple', fontsize=12, ha='left')
-
-
-    plt.title("Uplift ターゲットセグメント（4象限分析）")
-    plt.xlabel(f"Predicted Sales without Ad (Control: $M_C(X)$)")
-    plt.ylabel("Predicted Uplift ($M_T(X) - M_C(X)$)")
-    plt.legend()
-    plt.grid(True, linestyle=':', alpha=0.5)
-    plt.show()
-
-# --- 実行 ---
-if final_uplifts is not None:
-    # 4象限分析を実行
-    plot_uplift_quadrant(final_uplifts, final_y_pred_control)
-
-
-# Upliftのヒストグラムの可視化
-def plot_uplift_histogram(uplift_values):
-    """
-    予測された Uplift 値の分布をヒストグラムでプロットする。
-
-    Args:
-        uplift_values (np.ndarray): 予測された Uplift 値 (T - C)。
-    """
-    plt.figure(figsize=(6, 4))
-
-    # 適切にビンの数を調整
-    plt.hist(uplift_values, bins=50)
-
-    # ゼロライン
-    plt.axvline(0, color='k', linestyle="--")
-
-    plt.title("Uplift のヒストグラム")
-    plt.xlabel("Uplift ($M_T(X) - M_C(X)$)")
-    plt.ylabel("件数")
-    plt.tight_layout()
-    plt.show()
-
-# --- 実行 ---
-if 'final_uplifts' in locals() and final_uplifts is not None:
-    plot_uplift_histogram(final_uplifts)
-'''# ----- 1) 散布図：予測（広告あり） vs uplift -----
-plt.figure(figsize=(8, 6))
-plt.scatter(y_pred_treatment, uplift, alpha=0.5)
-plt.xlabel("Predicted Sales (Treatment = 1)")
-plt.ylabel("Uplift (Treatment - Control)")
-plt.title("Uplift Effect Visualization")
-plt.show()
-
-# ----- 2) ヒストグラム：uplift の分布 -----
-plt.figure(figsize=(6,4))
-plt.hist(uplift, bins=30)
-plt.axvline(0, color='k', linestyle="--")
-plt.title("Uplift のヒストグラム")
-plt.xlabel("Uplift")
-plt.ylabel("件数")
-plt.tight_layout()
-plt.show()'''
-
-
-
-
-
-def analyze_bert_dimension(df: pd.DataFrame, dim_index: int, top_n: int = 10):
-    """
-    特定のBERT次元の値に基づいて、商品名（name）のTop NとBottom Nを抽出し、表示する。
-
-    Args:
-        df (pd.DataFrame): 'name'列と 'bert_vec'列を含むDataFrame。
-        dim_index (int): 抽出したいBERTベクトルのインデックス（0から始まる）。
-        top_n (int): 表示するTop/Bottomの数。
-    """
-    dim_num = dim_index
-    dim_col_name = f'bert_vec_{dim_num}_val'
-
-    # 1. BERT次元の値を抽出
-    try:
-        # ベクトルの指定された次元を新しい列として追加
-        df[dim_col_name] = df['bert_vec'].apply(lambda x: x[dim_index])
-    except IndexError:
-        print(f"エラー: BERTベクトルのインデックス {dim_index} が存在しません。")
-        return
-
-    # 2. 統計情報の表示
-    print(f"\n--- {dim_col_name} の統計情報 ---")
-    print(df[dim_col_name].describe())
-
-    # 3. ユニークな商品名ベースでソートし、Top/Bottom Nを抽出
-    df_unique_names = df.drop_duplicates(subset=['name'])
-
-    # Top N
-    top_names = (
-        df_unique_names.sort_values(by=dim_col_name, ascending=False)
-        .head(top_n)['name'].tolist()
+data_bert = add_continuous_ad_features(data_mm)
+data_bert["bert_vec"] = list(bert_features_batch(data_bert["name"].tolist(), layer=8))
+data_bert_reduced = reduce_bert_dimension(data_bert.copy(),
+                                          input_dim=768,
+                                          latent_dim=24,
+                                          epochs=100)
+
+print("\n--- 削減後のデータフレームの先頭 ---")
+print(data_bert_reduced[['name', 'bert_vec_reduced']].head())
+print("\n削減後の特徴量の次元数:", data_bert_reduced['bert_vec_reduced'].iloc[0].shape)
+
+prepared_data = prepare_data_for_ann(data_bert_reduced.copy(), target_col='売上数')
+print("\n--- PyTorch Tensor の形状 ---")
+print(f"訓練セット X: {prepared_data['X_train_t'].shape}, y: {prepared_data['y_train_t'].shape}")
+print(f"検証セット X: {prepared_data['X_val_t'].shape}, y: {prepared_data['y_val_t'].shape}")
+print(f"テストセット X: {prepared_data['X_test_t'].shape}, y: {prepared_data['y_test_t'].shape}")
+# 特徴量リスト（ANNモデルの入力次元数に対応）
+final_feature_names = prepared_data['feature_names']
+print("-- 選択した特徴量 --\n",final_feature_names)
+
+# モデルの学習と評価
+y_true, y_pred , model= train_and_evaluate_ann(prepared_data, epochs=200)
+
+# 特徴量重要度分析の実行
+pi_df = feature_importance_analysis(model, prepared_data, y_true, y_pred) # 新しく追加
+# PIの上位N個の特徴量を選択
+N_TOP_FEATURES = 10
+top_pi_features = pi_df['Feature'].head(N_TOP_FEATURES).tolist()
+print(f"\n--- Permutation Importance (PI) 上位 {N_TOP_FEATURES} 特徴量 ---")
+print(top_pi_features)
+
+# Uplift Visualizationの実行
+# Individual Uplift Score の計算 (S-Learner)
+M_C, M_T, individual_uplift = calculate_individual_uplift(model, prepared_data)
+# Uplift Visualizationの実行 (Individual Uplift スコアを使用)
+if M_C is not None:
+    uplift_visualization(M_C, individual_uplift)
+    # 動的なPI上位特徴量を使って分析関数の実行
+    df_comparison_result, df_counts = analyze_uplift_segments(
+        M_C,
+        individual_uplift,
+        prepared_data,
+        top_pi_features=top_pi_features,
+        uplift_threshold=0.0,
+        # mc_threshold=120.0
     )
-    # Bottom N
-    bottom_names = (
-        df_unique_names.sort_values(by=dim_col_name, ascending=True)
-        .head(top_n)['name'].tolist()
-    )
-
-    # 4. 結果出力
-    print(f"\n====================================")
-    print(f" {dim_col_name} が最も高い商品名 (Top {top_n})")
-    print(f"====================================")
-    for i, name in enumerate(top_names, 1):
-        print(f"{i}. {name}")
-
-    print(f"\n====================================")
-    print(f" {dim_col_name} が最も低い商品名 (Bottom {top_n})")
-    print(f"====================================")
-    for i, name in enumerate(bottom_names, 1):
-        print(f"{i}. {name}")
-
-
-    # 処理後に一時列を削除（任意）
-    del df[dim_col_name]
-# analyze_bert_dimension(data_api.copy(), dim_index=9, top_n=5)
-# analyze_bert_dimension(data_api.copy(), dim_index=6, top_n=5)
-# analyze_bert_dimension(data_api.copy(), dim_index=463, top_n=5)
+    # print(f"\n--- セグメント別 サンプル数 ---")
+    # print(df_counts.to_markdown(index=False))
+    print(f"\n--- 主要な特徴量のセグメント別比較 ---")
+    print(df_comparison_result.to_markdown(index=False))
