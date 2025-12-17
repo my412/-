@@ -13,6 +13,9 @@ from sklearn.preprocessing import MinMaxScaler
 import lightgbm as lgb
 from sklearn.preprocessing import StandardScaler
 from typing import Dict, Any, Tuple
+import re
+import optuna
+from optuna.integration import PyTorchLightningPruningCallback
 
 
 # ---- モデル読み込み（中間層を返す設定） ----
@@ -21,7 +24,7 @@ model = BertModel.from_pretrained("bert-base-uncased", output_hidden_states=True
 
 
 # --- 前処理を関数化 ---
-def preprocess(retail_df, weather_df):
+def preprocess(retail_df, weather_df, correlation_threshold=0.9):
     # 日付処理
     weather_df['日付'] = pd.to_datetime(weather_df['年月日.1'], errors='coerce')
     weather_df = weather_df.loc[:, ~weather_df.columns.str.contains(r'\.\d+$')]
@@ -118,6 +121,47 @@ def preprocess(retail_df, weather_df):
 
     # 使いやすい順に列を整える（任意）
     merged = merged.reset_index(drop=True)
+
+    # 高相関特徴量の自動削除
+    print(f"\n--- 相関分析による特徴量フィルタリング (閾値: {correlation_threshold}) を開始 ---")
+
+    # BERT特徴量以外の数値列のみを選択 (bert_vec_reducedは後で結合されるためここでは除外)
+    # name, 日付, 売上高, 売上数 を除く、最終的な数値特徴量リスト
+    final_num_cols = merged.select_dtypes(include=np.number).columns.tolist()
+
+    # 目的変数やID的な列を除外
+    cols_to_exclude = ['売上数', '売上高', '日付']
+    feature_cols = [c for c in final_num_cols if c not in cols_to_exclude]
+
+    corr_matrix = merged[feature_cols].corr().abs()
+
+    # 上三角行列を取得 (重複を避けるため)
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+
+    # 閾値を超える特徴量を特定
+    cols_to_drop_corr = set()
+    for col in upper.columns:
+        # 閾値を超える相関を持つ特徴量を見つける
+        high_corr_features = upper.index[upper[col] > correlation_threshold]
+
+        # 削除リストに追加 (ここでは、ペアのうち後にある列 'col' を優先的に削除)
+        # より洗練された方法としては、平均PIが低い方を削除すべきですが、前処理ではシンプルに。
+        for feature_to_drop in high_corr_features:
+            # ペアのうち、すでに削除リストにない方の特徴量を選ぶ (列 'col' を残す)
+            # NOTE: 'col' を残し、'feature_to_drop' を削除リストに入れる
+            if feature_to_drop not in cols_to_drop_corr:
+                cols_to_drop_corr.add(feature_to_drop)
+
+    cols_to_drop_corr = list(cols_to_drop_corr)
+
+    if cols_to_drop_corr:
+        merged = merged.drop(columns=cols_to_drop_corr, errors='ignore')
+        print(f" 高相関 ({correlation_threshold}以上) のため {len(cols_to_drop_corr)} 個の特徴量を削除しました:")
+        print(cols_to_drop_corr)
+    else:
+        print(" 削除対象となる高相関な特徴量は見つかりませんでした。")
+
+    print(f"最終的な特徴量候補数 (BERT特徴量を除く): {len(merged.columns) - 2} 個")  # name, 日付 を除く概算
     return merged
 
 
@@ -379,37 +423,251 @@ def to_tensor_Xy(X_np, y_np):
     return X_t, y_t
 
 
+def prepare_data_for_ann_filtered(df, target_col='売上数', features_to_drop=[]):
+    y = df[target_col].values.reshape(-1, 1)
+
+    drop_cols_base = ['name', '日付', '売上高', target_col]
+
+    # BERT特徴量を DataFrame の列に戻す
+    bert_reduced_df = pd.DataFrame(df['bert_vec_reduced'].tolist(),
+                                   index=df.index,
+                                   columns=[f'bert_reduced_{i}' for i in
+                                            range(df['bert_vec_reduced'].iloc[0].shape[0])])
+
+    # 最終的な特徴量 DataFrame の作成
+    X_base = df.drop(columns=drop_cols_base + ['bert_vec_reduced'], errors='ignore')
+    X_combined = pd.concat([X_base, bert_reduced_df], axis=1)
+
+    # PIでマイナスだった特徴量を削除
+    X = X_combined.drop(columns=features_to_drop, errors='ignore')
+
+    feature_names = X.columns.tolist()
+
+    # 訓練:検証:テスト 分割
+    train_ratio = 0.8;
+    val_test_ratio = 0.2;
+    val_ratio_in_val_test = 0.5
+    n_samples = len(X)
+    n_train = int(n_samples * train_ratio)
+    n_val_test = n_samples - n_train
+    n_val = int(n_val_test * val_ratio_in_val_test)
+
+    train_idx = X.index[:n_train];
+    val_idx = X.index[n_train:n_train + n_val];
+    test_idx = X.index[n_train + n_val:n_samples]
+    X_train, y_train = X.loc[train_idx], y[train_idx]
+    X_val, y_val = X.loc[val_idx], y[val_idx]
+    X_test, y_test = X.loc[test_idx], y[test_idx]
+
+    # 特徴量 (X) の正規化: StandardScaler
+    X_scaler = StandardScaler()
+    X_scaler.fit(X_train)
+    X_train_scaled = X_scaler.transform(X_train)
+    X_val_scaled = X_scaler.transform(X_val)
+    X_test_scaled = X_scaler.transform(X_test)
+
+    # 目的変数 (y) の正規化: MinMaxScaler
+    y_scaler = MinMaxScaler()
+    y_scaler.fit(y_train)
+    y_train_scaled = y_scaler.transform(y_train)
+    y_val_scaled = y_scaler.transform(y_val)
+    y_test_scaled = y_scaler.transform(y_test)
+
+    # PyTorch Tensor への変換
+    X_train_t, y_train_t = to_tensor_Xy(X_train_scaled, y_train_scaled.flatten())
+    X_val_t, y_val_t = to_tensor_Xy(X_val_scaled, y_val_scaled.flatten())
+    X_test_t, y_test_t = to_tensor_Xy(X_test_scaled, y_test_scaled.flatten())
+
+    return {
+        'X_train_t': X_train_t, 'y_train_t': y_train_t, 'X_val_t': X_val_t, 'y_val_t': y_val_t,
+        'X_test_t': X_test_t, 'y_test_t': y_test_t, 'feature_names': feature_names,
+        'y_scaler': y_scaler, 'X_scaler': X_scaler, 'train_idx': train_idx, 'val_idx': val_idx, 'test_idx': test_idx
+    }
+
 # --- ANN モデル定義と学習処理 ---
-# 1. ANNモデルの定義
-class RegressionANN(nn.Module):
-    def __init__(self, input_dim):
+# ANNモデルの再定義（Optunaのパラメータを受け入れるように修正）
+class OptimizedANN(nn.Module):
+    def __init__(self, input_dim, trial):
         super().__init__()
-        # 隠れ層の定義
-        self.net = nn.Sequential(OrderedDict([
-        ('hidden1', nn.Linear(input_dim, 300)),
-        ('bn1', nn.BatchNorm1d(300)),
-        ('act1', nn.ReLU()),
-        ('drop1', nn.Dropout(0.3)),
-        ('hidden2', nn.Linear(300, 200)),
-        ('bn2', nn.BatchNorm1d(200)),
-        ('act2', nn.ReLU()),
-        ('drop2', nn.Dropout(0.3)),
-        ('hidden3', nn.Linear(200, 100)),
-        ('bn3', nn.BatchNorm1d(100)),
-        ('act3', nn.ReLU()),
-        ('drop3', nn.Dropout(0.3)),
-        ('hidden4', nn.Linear(100, 50)),
-        ('bn4', nn.BatchNorm1d(50)),
-        ('act4', nn.ReLU()),
-        ('drop4', nn.Dropout(0.2)),
-        ('output', nn.Linear(50, 1))
-    ]))
+
+        # 隠れ層の数 (Optunaで探索)
+        n_layers = trial.suggest_int('n_layers', 2, 5)
+
+        layers = OrderedDict()
+        input_size = input_dim
+
+        for i in range(1, n_layers + 1):
+            # ユニット数の探索
+            output_size = trial.suggest_int(f'n_units_l{i}', 32, 512, log=True)
+            # ドロップアウト率の探索
+            dropout_rate = trial.suggest_float(f'dropout_l{i}', 0.1, 0.5)
+
+            layers[f'hidden{i}'] = nn.Linear(input_size, output_size)
+            layers[f'bn{i}'] = nn.BatchNorm1d(output_size)
+            layers[f'act{i}'] = nn.ReLU()
+            layers[f'drop{i}'] = nn.Dropout(dropout_rate)
+
+            input_size = output_size  # 次の層の入力サイズを更新
+
+        # 最終出力層
+        layers['output'] = nn.Linear(input_size, 1)
+
+        self.net = nn.Sequential(layers)
 
     def forward(self, x):
         return self.net(x)
 
-# 2. ANNモデルの学習と評価
-def train_and_evaluate_ann(prepared_data, epochs=100, lr=1e-3):
+# Optunaの目的関数
+'''def objective_ann(trial, prepared_data):
+    # データとスケーラーの取り出し
+    X_train_t = prepared_data['X_train_t']
+    y_train_t = prepared_data['y_train_t']
+    X_val_t = prepared_data['X_val_t']
+    y_val_t = prepared_data['y_val_t']
+    y_scaler = prepared_data['y_scaler']
+
+    input_dim = X_train_t.shape[1]
+
+    # モデルのインスタンス化 (Optunaのトライアルを渡す)
+    model = OptimizedANN(input_dim, trial)
+
+    # 学習率の探索
+    lr = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
+
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    epochs = 100  # Optunaでは短いエポック数に設定（時間短縮のため）
+
+    # 学習ループ
+    for epoch in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        outputs = model(X_train_t)
+        loss = criterion(outputs, y_train_t)
+        loss.backward()
+        optimizer.step()
+
+        # 検証データでの評価（プルーニングのために使用）
+        model.eval()
+        with torch.no_grad():
+            val_outputs = model(X_val_t)
+            val_loss = criterion(val_outputs, y_val_t)
+
+
+    # 最終評価: 検証データでのRMSE (元のスケール)
+    model.eval()
+    with torch.no_grad():
+        y_val_pred_scaled_t = model(X_val_t)
+
+    # スケールを元に戻す
+    y_val_pred = y_scaler.inverse_transform(y_val_pred_scaled_t.numpy())
+    y_val_true = y_scaler.inverse_transform(y_val_t.numpy())
+
+    # 評価指標 (RMSEを返す)
+    rmse = np.sqrt(mean_squared_error(y_val_true, y_val_pred))
+
+    return rmse
+'''
+def objective_ann(trial, prepared_data):
+    # -----------------------------
+    # データ取り出し
+    # -----------------------------
+    X_train_t = prepared_data['X_train_t']
+    y_train_t = prepared_data['y_train_t']
+    X_val_t = prepared_data['X_val_t']
+    y_val_t = prepared_data['y_val_t']
+    y_scaler = prepared_data['y_scaler']
+
+    input_dim = X_train_t.shape[1]
+
+    # -----------------------------
+    # モデル生成（構造は Optuna に任せる）
+    # -----------------------------
+    model = OptimizedANN(input_dim, trial)
+
+    # -----------------------------
+    # ハイパーパラメータ
+    # -----------------------------
+    lr = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
+
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    # -----------------------------
+    # 最大エポック（上限だけ決める）
+    # -----------------------------
+    max_epochs = 1000
+
+    # -----------------------------
+    # 学習ループ + Pruning
+    # -----------------------------
+    for epoch in range(max_epochs):
+        # ---- train ----
+        model.train()
+        optimizer.zero_grad()
+        outputs = model(X_train_t)
+        loss = criterion(outputs, y_train_t)
+        loss.backward()
+        optimizer.step()
+
+        # ---- validation ----
+        model.eval()
+        with torch.no_grad():
+            val_outputs = model(X_val_t)
+            val_loss = criterion(val_outputs, y_val_t)
+
+        # ---- Optuna に報告 ----
+        trial.report(val_loss.item(), step=epoch)
+
+        # ---- Pruning 判定 ----
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
+
+    # -----------------------------
+    # 最終評価（RMSE：元スケール）
+    # -----------------------------
+    model.eval()
+    with torch.no_grad():
+        y_val_pred_scaled_t = model(X_val_t)
+
+    y_val_pred = y_scaler.inverse_transform(
+        y_val_pred_scaled_t.cpu().numpy()
+    )
+    y_val_true = y_scaler.inverse_transform(
+        y_val_t.cpu().numpy()
+    )
+
+    rmse = np.sqrt(mean_squared_error(y_val_true, y_val_pred))
+    return rmse
+
+# 最適化された構造を持つ ANN クラスを定義
+class FinalOptimizedANN(nn.Module):
+    def __init__(self, input_dim, params):
+        super().__init__()
+
+        n_layers = params['n_layers']
+        layers = OrderedDict()
+        input_size = input_dim
+
+        for i in range(1, n_layers + 1):
+            output_size = params[f'n_units_l{i}']
+            dropout_rate = params[f'dropout_l{i}']
+
+            layers[f'hidden{i}'] = nn.Linear(input_size, output_size)
+            layers[f'bn{i}'] = nn.BatchNorm1d(output_size)
+            layers[f'act{i}'] = nn.ReLU()
+            layers[f'drop{i}'] = nn.Dropout(dropout_rate)
+
+            input_size = output_size
+
+        layers['output'] = nn.Linear(input_size, 1)
+        self.net = nn.Sequential(layers)
+
+    def forward(self, x):
+        return self.net(x)
+# 最終学習とテスト評価を実行する関数
+def final_train_and_evaluate(prepared_data, best_params, epochs, lr):
     # データとスケーラーの取り出し
     X_train_t = prepared_data['X_train_t']
     y_train_t = prepared_data['y_train_t']
@@ -421,63 +679,67 @@ def train_and_evaluate_ann(prepared_data, epochs=100, lr=1e-3):
 
     input_dim = X_train_t.shape[1]
 
-    # モデルのインスタンス化
-    model = RegressionANN(input_dim)
+    # モデルのインスタンス化 (最適なハイパーパラメータを使用)
+    model = FinalOptimizedANN(input_dim, best_params)
 
     # 損失関数 (MSE) と最適化手法 (Adam) の定義
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    # 損失を記録するためのリスト
+    # 学習と検証の損失を記録
     train_losses = []
     val_losses = []
 
+    # 訓練データと検証データを結合し、訓練セットを拡大する戦略も有効ですが、
+    # ここでは既存の train_val_test 分割を維持し、モデルの性能を確認します。
+    X_train_full = torch.cat([X_train_t, X_val_t], dim=0)
+    y_train_full = torch.cat([y_train_t, y_val_t], dim=0)
+
+    print("\n--- 最終 ANN モデル学習を開始 ---")
+    print(f"構造: {best_params['n_layers']}層, 学習率: {lr:.5f}, エポック数: {epochs}")
+
     # 学習ループ
-    print("\n--- ANNモデル学習を開始 ---")
     for epoch in range(epochs):
         model.train()
 
         # 順伝播
-        outputs = model(X_train_t)
-        loss = criterion(outputs, y_train_t)
+        outputs = model(X_train_full)  # 訓練データと検証データを合わせたデータで学習
+        loss = criterion(outputs, y_train_full)
 
         # 逆伝播と最適化
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # 訓練損失を記録
         train_losses.append(loss.item())
 
-        # 検証データでの評価（スケーリングされた値での評価）
+        # 検証データでの評価（過学習モニタリング）
         model.eval()
         with torch.no_grad():
             val_outputs = model(X_val_t)
             val_loss = criterion(val_outputs, y_val_t)
-
-        # 検証損失を記録
         val_losses.append(val_loss.item())
 
-        if (epoch + 1) % 10 == 0 or epoch == 1:  # 1回目の損失も表示
+        if (epoch + 1) % 20 == 0 or epoch == 0:
             print(f'Epoch [{epoch + 1}/{epochs}], Train Loss: {loss.item():.6f}, Val Loss: {val_loss.item():.6f}')
 
-    # 2. 学習過程の可視化
+    # 1. 学習過程の可視化
     plt.figure(figsize=(10, 6))
     plt.plot(train_losses, label='Train Loss (MSE)')
     plt.plot(val_losses, label='Validation Loss (MSE)')
     plt.xlabel('Epoch')
     plt.ylabel('Loss (MSE)')
-    plt.title('ANN Model Learning Curve')
+    plt.title('Final ANN Model Learning Curve')
     plt.legend()
     plt.grid(True)
     plt.show()
 
-    # 3. テストデータでの評価
+    # 2. テストデータでの評価
     model.eval()
     with torch.no_grad():
         y_pred_scaled_t = model(X_test_t)
 
-    # 4. スケールを元に戻す (Inverse Transform)
+    # 3. スケールを元に戻す (Inverse Transform)
     y_pred_scaled_np = y_pred_scaled_t.numpy()
     y_test_scaled_np = y_test_t.numpy()
 
@@ -485,111 +747,257 @@ def train_and_evaluate_ann(prepared_data, epochs=100, lr=1e-3):
     y_pred = y_scaler.inverse_transform(y_pred_scaled_np)
     y_true = y_scaler.inverse_transform(y_test_scaled_np)
 
-    # 5. 評価指標の計算 (元のスケールで評価)
+    # 4. 評価指標の計算 (元のスケールで評価)
     mae = mean_absolute_error(y_true, y_pred)
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     r2 = r2_score(y_true, y_pred)
 
-    print("\n--- テストデータ評価 (元のスケール) ---")
+    print("\n--- 最終テストデータ評価 (元のスケール) ---")
     print(f"Mean Absolute Error (MAE): {mae:.2f}")
     print(f"Root Mean Squared Error (RMSE): {rmse:.2f}")
     print(f"R-squared (R2): {r2:.4f}")
 
     return y_true, y_pred, model
 
-
 # --- 特徴量重要度分析の実行(PI) ---
-def feature_importance_analysis(model, prepared_data, y_true, y_pred):
+def feature_importance_analysis_robust(model, prepared_data, y_true, y_pred, n_repeats=5):
+    """
+    Permutation Importance (PI) を複数回シャッフルすることでロバストに計算する関数。
+
+    Args:
+        model (nn.Module): 訓練済みのANNモデル。
+        prepared_data (Dict): prepare_data_for_annから返された辞書。
+        y_true (np.ndarray): テストデータの実測値（元のスケール）。
+        y_pred (np.ndarray): テストデータの予測値（元のスケール）。
+        n_repeats (int): シャッフルを繰り返す回数。
+
+    Returns:
+        pd.DataFrame: 特徴量の重要度（平均）を格納したDataFrame。
+    """
     X_test_t = prepared_data['X_test_t']
     feature_names = prepared_data['feature_names']
-
-    # -----------------------------------------------------------
-    # Permutation Importance (PI) の計算
-    # -----------------------------------------------------------
-
-    # PI はモデルの予測精度 (MSE) の変化を見るため、元のスケールで評価します。
-    # 目的変数スケーラー (y_scaler) を使って、予測関数を定義する必要があります。
     y_scaler = prepared_data['y_scaler']
 
-    # モデルの予測を元のスケールに戻す関数
+    # モデルの予測を元のスケールに戻す関数 (変更なし)
     def predict_unscaled(model, X_tensor):
         model.eval()
         with torch.no_grad():
-            # 予測結果 (Scaled)
             y_pred_scaled = model(X_tensor).numpy()
-            # 予測結果を元のスケールに戻す
             y_pred_unscaled = y_scaler.inverse_transform(y_pred_scaled)
             return y_pred_unscaled.flatten()
 
-    # テストデータのNumpy配列 (Scaled)
-    X_test_np = X_test_t.numpy()
-
-    # PI計算のための損失関数 (ここでは Mean Squared Error を使用)
+    # 損失関数 (MSE) (変更なし)
     def mse_loss(y_true, y_pred):
         return mean_squared_error(y_true, y_pred)
 
-    # Permutation Importance の計算
-    # 訓練済みモデルとテストデータセット（Numpy）を使用
-    print("\n--- 1. Permutation Importance (PI) の計算 ---")
+    X_test_np = X_test_t.numpy()
 
-    # ベースラインスコア (シャッフルなし)
+    print("\n--- 1. Permutation Importance (PI) の計算 ---")
+    print(f"--- シャッフル回数: {n_repeats} 回 ---")
+
+    # ベースラインスコア (シャッフルなし) は一度だけ計算
     baseline_pred = predict_unscaled(model, X_test_t)
     baseline_score = mse_loss(y_true, baseline_pred)
     print(f"ベースライン MSE (シャッフルなし): {baseline_score:.2f}")
 
-    pi_scores = {}
+    # PIスコアを記録するためのDataFrame (特徴量 × 繰り返し回数)
+    all_pi_scores = pd.DataFrame(index=feature_names)
 
-    for i, name in enumerate(feature_names):
-        # i番目の特徴量をシャッフル
-        X_test_shuffled = X_test_np.copy()
-        X_test_shuffled[:, i] = np.random.permutation(X_test_shuffled[:, i])
+    for repeat in range(n_repeats):
+        current_pi_scores = {}
 
-        # シャッフル後の予測
-        X_shuffled_t = torch.from_numpy(X_test_shuffled).float()
-        shuffled_pred = predict_unscaled(model, X_shuffled_t)
+        # 繰り返し回数ごとにランダムシードを設定して再現性を高める
+        np.random.seed(42 + repeat)
 
-        # 損失の増加
-        shuffled_score = mse_loss(y_true, shuffled_pred)
-        pi_scores[name] = shuffled_score - baseline_score
+        for i, name in enumerate(feature_names):
+            # i番目の特徴量をシャッフル
+            X_test_shuffled = X_test_np.copy()
+            # np.random.permutation で i 列目の値をシャッフル
+            X_test_shuffled[:, i] = np.random.permutation(X_test_shuffled[:, i])
 
-    # 結果をDataFrameに格納し、ソート
-    pi_df = pd.DataFrame(list(pi_scores.items()), columns=['Feature', 'Importance (MSE Increase)'])
-    pi_df = pi_df.sort_values(by='Importance (MSE Increase)', ascending=False).reset_index(drop=True)
+            # シャッフル後の予測と損失の計算
+            X_shuffled_t = torch.from_numpy(X_test_shuffled).float()
+            shuffled_pred = predict_unscaled(model, X_shuffled_t)
+            shuffled_score = mse_loss(y_true, shuffled_pred)
+
+            # 損失の増加を記録
+            current_pi_scores[name] = shuffled_score - baseline_score
+
+        # 今回の試行結果を DataFrame に追加
+        all_pi_scores[f'Repeat_{repeat + 1}'] = pd.Series(current_pi_scores)
+
+    # 全ての試行の平均を最終的な重要度とする
+    pi_df = pd.DataFrame()
+    pi_df['Importance (MSE Increase)'] = all_pi_scores.mean(axis=1)
+    pi_df = pi_df.sort_values(by='Importance (MSE Increase)', ascending=False).reset_index()
+    pi_df = pi_df.rename(columns={'index': 'Feature'})
 
     # 可視化
     plt.figure(figsize=(12, pi_df.shape[0] * 0.3))
     plt.barh(pi_df['Feature'], pi_df['Importance (MSE Increase)'])
-    plt.xlabel('Importance (Increase in MSE after permutation)')
-    plt.title('Permutation Importance')
+    plt.xlabel(f'Average Importance (Increase in MSE after {n_repeats} repeats)')
+    plt.title('Permutation Importance (Robust)')
     plt.gca().invert_yaxis()
     plt.tight_layout()
     plt.show()
 
-    '''# -----------------------------------------------------------
-    # 2. SHAP (SHapley Additive exPlanations) の計算と可視化
-    # -----------------------------------------------------------
+    print("\n--- ロバスト PI 計算完了 ---")
+    print(pi_df.head(10))
 
-    # SHAPを計算するためのライブラリをインポート
-    import shap
-
-    print("\n--- 2. SHAP (SHapley Additive exPlanations) の計算 ---")
-
-    # 背景データとして訓練データの一部を使用 (計算コスト削減のため)
-    X_train_np = prepared_data['X_train_t'].numpy()
-    background = X_train_np[np.random.choice(X_train_np.shape[0], 100, replace=False)]
-
-    # DeepExplainer の使用（ニューラルネットワーク向け）
-    explainer = shap.DeepExplainer(model, torch.from_numpy(background).float())
-
-    # テストデータに対するSHAP値の計算 (注意: 時間がかかる場合があります)
-    shap_values = explainer.shap_values(X_test_t)
-
-    # SHAP要約プロット (全体的な特徴量の重要度)
-    print("\nSHAP Summary Plot (特徴量の全体的な影響度)")
-    # 特徴量名をNumPy配列に変換して渡す
-    shap.summary_plot(shap_values, X_test_np, feature_names=feature_names)
-    '''
     return pi_df
+
+
+def iterative_feature_selection_and_hpo_integrated_optimized(
+        data_bert_reduced,
+        prepared_data_initial,
+        best_params_initial,
+        epochs_final,
+        final_lr,
+        max_iterations=5,
+        pi_repeats=100,
+        n_trials_hpo=100
+):
+    """
+    PIがゼロ以下の特徴量がなくなるまで、データフィルタリングと
+    Optunaによるハイパーパラメータ再最適化、モデル再訓練を繰り返す。
+
+    【改良点】全イテレーションの中で最もテストRMSEが良かったモデルを採用する（早期停止の原則）。
+    """
+
+    # Uplift分析に必要な特徴量 (ガードレール)
+    GUARDRAIL_FEATURES = ['広告_有無']
+
+    all_features_dropped = []
+    prepared_data_current = prepared_data_initial
+
+    # 初期パラメータを格納
+    current_best_params = best_params_initial
+    current_final_lr = final_lr
+
+    # 🏆 ベストモデル追跡用の変数を初期化 🏆
+    best_rmse = float('inf')  # 最小RMSEを無限大で初期化
+    best_model = None
+    best_feature_names = prepared_data_initial['feature_names']
+    best_evaluation_results = None
+
+    for iteration in range(max_iterations):
+        print(f"\n====================== 🚀 イテレーション {iteration + 1} を開始 🚀 ======================")
+
+        # ----------------------------------------------------
+        # I. Optuna HPO の再最適化 (2回目以降)
+        # ----------------------------------------------------
+        # ... (HPOのロジックは変更なし) ...
+        if iteration > 0:
+            print(
+                f"--- 1. Optuna HPO ({n_trials_hpo} trials) を開始 (特徴量数: {len(prepared_data_current['feature_names'])}) ---")
+            study_ann = optuna.create_study(direction='minimize', study_name=f'ann_hpo_iter_{iteration + 1}')
+            study_ann.optimize(lambda trial: objective_ann(trial, prepared_data_current),
+                               n_trials=n_trials_hpo,
+                               show_progress_bar=True)
+
+            current_best_params = study_ann.best_params
+            current_final_lr = current_best_params['learning_rate']
+
+            print(f"Optuna結果: ベスト検証RMSE: {study_ann.best_value:.4f}, ベストLR: {current_final_lr:.5f}")
+            # ... (パラメータ表示は省略)
+        else:
+            print(f"--- 1. 初期Optuna結果を使用 (特徴量数: {len(prepared_data_current['feature_names'])}) ---")
+
+        # ----------------------------------------------------
+        # II. 最適化されたモデルの訓練とテスト評価
+        # ----------------------------------------------------
+        print(f"--- 2. 最終モデルの訓練 ({epochs_final} epochs) と PI 計算 ---")
+
+        y_true, y_pred, final_model_current = final_train_and_evaluate(  # 変数名を変更
+            prepared_data=prepared_data_current,
+            best_params=current_best_params,
+            epochs=epochs_final,
+            lr=current_final_lr
+        )
+
+        if final_model_current is None:
+            print("モデル訓練に失敗しました。反復を終了します。")
+            break
+
+        # ----------------------------------------------------
+        # III. 🏆 ベストモデルの判定と更新 🏆
+        # ----------------------------------------------------
+        current_rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        print(f"現在のテスト評価 RMSE: {current_rmse:.4f}")
+
+        if current_rmse < best_rmse:
+            print(f"  ✨ RMSEが {best_rmse:.4f} から {current_rmse:.4f} に改善！このモデルを採用候補として保存します。")
+            best_rmse = current_rmse
+            best_model = final_model_current
+            best_feature_names = prepared_data_current['feature_names']
+            best_evaluation_results = (y_true, y_pred)
+        else:
+            print(f"  ⚠️ RMSEは改善しませんでした (現在の最良 RMSE: {best_rmse:.4f})。")
+
+        # ----------------------------------------------------
+        # IV. Permutation Importance (PI) の計算とフィルタリング
+        # ----------------------------------------------------
+        # PIの計算は、フィルタリングの判断のために常に実行する必要がある
+        pi_result_df = feature_importance_analysis_robust(
+            model=final_model_current,
+            prepared_data=prepared_data_current,
+            y_true=y_true,
+            y_pred=y_pred,
+            n_repeats=pi_repeats
+        )
+
+        # ... (PIフィルタリングとガードレール処理は変更なし) ...
+
+        # PIがゼロ以下の特徴量（自動削除候補）
+        negative_pi_features_auto = pi_result_df[
+            pi_result_df['Importance (MSE Increase)'] <= 0
+            ]['Feature'].tolist()
+
+        # ==========  ガードレール処理の追加  ==========
+        initial_num_negative = len(negative_pi_features_auto)
+
+        features_to_drop = [
+            f for f in negative_pi_features_auto if f not in GUARDRAIL_FEATURES
+        ]
+
+        num_negative = len(features_to_drop)
+
+        if initial_num_negative > num_negative:
+            print(
+                f" ガードレール起動: {initial_num_negative - num_negative} 個の特徴量 (広告_有無など) を削除リストから除外しました。")
+        # =================================================
+
+        print(f"\n--- PI フィルタリング結果 (イテレーション {iteration + 1}) ---")
+        print(f"削除対象の特徴量数: {num_negative} 個")
+        print([f for f in features_to_drop if f not in GUARDRAIL_FEATURES])
+
+        # ----------------------------------------------------
+        # V. 終了条件の確認と次のデータ準備
+        # ----------------------------------------------------
+        if num_negative == 0 or iteration == max_iterations - 1:
+            print("\n✅ 特徴量フィルタリングが完了しました。反復を終了します。")
+            break
+
+        # 次のイテレーションのために特徴量リストを更新
+        all_features_dropped.extend(features_to_drop)
+        all_features_dropped = list(set(all_features_dropped))  # 重複削除
+
+        # 新しいフィルタリング済みデータセットを準備
+        prepared_data_current = prepare_data_for_ann_filtered(
+            data_bert_reduced.copy(),
+            target_col='売上数',
+            features_to_drop=all_features_dropped
+        )
+
+    print("\n====================== ✅ 処理が完了しました ✅ ======================")
+    print("🏆 最終的な採用モデルは、全イテレーションの中で最も精度が良かったものです。")
+    print(f"採用モデルの特徴量数: {len(best_feature_names)}")
+    print(f"最終採用モデルのテスト評価 RMSE: {best_rmse:.4f}")
+
+    # 最終的な返り値は、最も精度の良かった時点のモデルと特徴量とする
+    return best_feature_names, best_model, best_evaluation_results
+
+
 
 
 # --- Uplift Modeling (広告効果) の可視化 ---
@@ -713,7 +1121,6 @@ def analyze_uplift_segments(
         prepared_data: Dict[str, Any],
         top_pi_features: list,
         uplift_threshold: float = 0.0,
-        # mc_threshold: float = M_C.mean()
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     個別Upliftスコアに基づきデータをセグメント化し、主要な特徴量の平均値を比較する。
@@ -756,7 +1163,7 @@ def analyze_uplift_segments(
         print("エラー: 比較に必要なサンプルが不足しています。セグメントの閾値を確認してください。")
         return pd.DataFrame(), df_segment_counts
 
-    # 3. 特徴量比較の構築
+    # 特徴量比較の構築
     # PI上位特徴量に、広告・相互作用・連続広告特徴量を統合
     # BERT特徴量は少なくとも一つ含める (例: bert_reduced_0)
     essential_features = [
@@ -808,12 +1215,159 @@ def analyze_uplift_segments(
 
     df_comparison = pd.DataFrame(comparison_data)
 
+    # 可視化 (ヒストグラム)
+    # BERT特徴量を除外した可視化対象の特徴量リストを作成
+    features_to_plot = [
+        f for f in key_features if not f.startswith('bert_reduced')
+    ]
+
+    print(f"\n--- 📊 非BERT特徴量 ({len(features_to_plot)}個) のセグメント別ヒストグラム (個別出力) ---")
+
+    if features_to_plot:
+
+        for feature in features_to_plot:
+            # 特徴量ごとに新しい図を作成
+            plt.figure(figsize=(10, 6), dpi=100)
+
+            # Persuadables
+            plt.hist(
+                df_persuadables[feature].dropna(),
+                bins=15,
+                alpha=0.6,
+                label=f'Persuadables (N={len(df_persuadables)})',
+                color='green',
+                density=True
+            )
+
+            # Sleepers/Lost Causes
+            plt.hist(
+                df_lost_sleepers[feature].dropna(),
+                bins=15,
+                alpha=0.6,
+                label=f'Sleepers/Lost Causes (N={len(df_lost_sleepers)})',
+                color='red',
+                density=True
+            )
+
+            plt.title(f'分布比較: {feature}', fontsize=16)
+            plt.xlabel(feature, fontsize=14)
+            plt.ylabel('密度', fontsize=14)
+
+            # 凡例を適切に配置
+            plt.legend(
+                loc='upper right',
+                fontsize=10
+            )
+            plt.grid(axis='y', linestyle=':', alpha=0.5)
+
+            # 図を表示
+            plt.tight_layout()
+            plt.show()
+    else:
+        print("警告: 可視化する非BERT特徴量が見つかりませんでした。")
+
     return df_comparison, df_segment_counts
 
 
+def analyze_bert_dimension(df: pd.DataFrame, dim_index: int, top_n: int = 13):
+    """
+    特定のBERT次元の値に基づいて、商品名（name）のTop NとBottom Nを抽出し、表示する。
+
+    Args:
+        df (pd.DataFrame): 'name'列と 'bert_vec'列を含むDataFrame。
+        dim_index (int): 抽出したいBERTベクトルのインデックス（0から始まる）。
+        top_n (int): 表示するTop/Bottomの数。
+    """
+    dim_num = dim_index
+    dim_col_name = f'bert_vec_{dim_num}'  # 元のBERTベクトルの次元名を定義
+
+    # 1. BERT次元の値を抽出
+    try:
+        # ベクトルの指定された次元を新しい列として追加
+        # ここでは、元の768次元のbert_vecから値を抽出することを想定
+        df[dim_col_name] = df['bert_vec'].apply(lambda x: x[dim_index])
+    except IndexError:
+        print(f"エラー: BERTベクトルのインデックス {dim_index} が存在しません。")
+        return
+
+    # 2. 統計情報の表示
+    print(f"\n--- {dim_col_name} の統計情報 ---")
+    print(df[dim_col_name].describe())
+
+    # 3. ユニークな商品名ベースでソートし、Top/Bottom Nを抽出
+    # 同じ商品名に複数のデータがある場合（=同じ商品だが異なる店舗/日付）を考慮し、
+    # 各商品名について、その次元の平均値を使用して代表値とする
+    df_unique_names = df.groupby('name')[dim_col_name].mean().reset_index()
+
+    # Top N
+    top_names = (
+        df_unique_names.sort_values(by=dim_col_name, ascending=False)
+        .head(top_n)['name'].tolist()
+    )
+
+    # 代表的な値（Top/Bottomの平均値）も計算
+    top_mean_val = df_unique_names.sort_values(by=dim_col_name, ascending=False).head(top_n)[dim_col_name].mean()
+
+    # 4. 結果出力
+    print(f"\n====================================")
+    print(f"📈 {dim_col_name} が最も高い商品名 (Top {top_n}, 平均値: {top_mean_val:.4f})")
+    print(f"====================================")
+    for i, name in enumerate(top_names, 1):
+        print(f"{i}. {name}")
+
+
+def analyze_top_bert_features_automatically(
+        pi_result_df: pd.DataFrame,
+        full_data_df: pd.DataFrame,
+        n_top: int = 2
+):
+    """
+    PI結果から重要度上位のBERT特徴量を自動選択し、analyze_bert_dimension関数で分析する。
+
+    Args:
+        pi_result_df (pd.DataFrame): Permutation Importanceの結果DataFrame (Feature, Importance (MSE Increase)を含む)。
+        full_data_df (pd.DataFrame): 'name'列と 'bert_vec'列を含む元のデータフレーム (analyze_bert_dimension用)。
+        n_top (int): 分析する上位BERT特徴量の数。
+    """
+    print("\n======================  自動 BERT 特徴量分析を開始  ======================")
+
+    # 1. PI結果を重要度順にソート（既にソート済みと仮定）
+    df_sorted = pi_result_df.copy()
+
+    # 2. BERT特徴量のみをフィルタリング
+    bert_features = df_sorted[
+        df_sorted['Feature'].str.startswith('bert_reduced_')
+    ].head(n_top)
+
+    if bert_features.empty:
+        print("エラー: PI結果に 'bert_reduced_' で始まる特徴量が見つかりませんでした。")
+        return
+
+    print(f"--- PI上位 {n_top} の BERT 特徴量 ---")
+    print(bert_features[['Feature', 'Importance (MSE Increase)']].to_markdown(index=False))
+
+    # 3. インデックスの抽出と分析の実行
+    for index, row in bert_features.iterrows():
+        feature_name = row['Feature']
+        # 正規表現を使用して特徴量名から数字（インデックス）を抽出
+        match = re.search(r'bert_reduced_(\d+)', feature_name)
+
+        if match:
+            # 抽出されたインデックスは、元のBERTベクトルのインデックスとして使用
+            dim_index = int(match.group(1))
+
+            print(f"\n--- 💡 特徴量: {feature_name} (元のBERT次元インデックス: {dim_index}) の分析 ---")
+
+            # analyze_bert_dimension 関数を実行
+            analyze_bert_dimension(full_data_df.copy(), dim_index=dim_index)
+        else:
+            print(f"警告: 特徴量名 {feature_name} からインデックスを抽出できませんでした。")
+
+    print("\n====================== ✅ 自動 BERT 特徴量分析が完了しました ✅ ======================")
+
 # ======================================================================================================================
 
-
+# ===== データ準備・前処理・次元削減 =====
 pd.set_option('display.max_columns', None)  # すべての列を表示
 pd.set_option('display.width', None)        # 横幅制限を解除
 
@@ -827,8 +1381,8 @@ data_bert = add_continuous_ad_features(data_mm)
 data_bert["bert_vec"] = list(bert_features_batch(data_bert["name"].tolist(), layer=8))
 data_bert_reduced = reduce_bert_dimension(data_bert.copy(),
                                           input_dim=768,
-                                          latent_dim=24,
-                                          epochs=100)
+                                          latent_dim=15,
+                                          epochs=150)
 
 print("\n--- 削減後のデータフレームの先頭 ---")
 print(data_bert_reduced[['name', 'bert_vec_reduced']].head())
@@ -843,33 +1397,118 @@ print(f"テストセット X: {prepared_data['X_test_t'].shape}, y: {prepared_da
 final_feature_names = prepared_data['feature_names']
 print("-- 選択した特徴量 --\n",final_feature_names)
 
-# モデルの学習と評価
-y_true, y_pred , model= train_and_evaluate_ann(prepared_data, epochs=200)
 
-# 特徴量重要度分析の実行
-pi_df = feature_importance_analysis(model, prepared_data, y_true, y_pred) # 新しく追加
-# PIの上位N個の特徴量を選択
-N_TOP_FEATURES = 10
-top_pi_features = pi_df['Feature'].head(N_TOP_FEATURES).tolist()
-print(f"\n--- Permutation Importance (PI) 上位 {N_TOP_FEATURES} 特徴量 ---")
-print(top_pi_features)
+# ===== 初期 Optuna 最適化 (best_params_initial の定義) =====
+'''study_ann = optuna.create_study(direction='minimize')
+N_TRIALS_INITIAL = 100
+
+print("\n--- 初期 Optuna 最適化を開始 (best_params_initial を取得) ---")
+# 目的関数を実行
+study_ann.optimize(lambda trial: objective_ann(trial, prepared_data),
+                   n_trials=N_TRIALS_INITIAL,
+                   show_progress_bar=True)'''
+study_ann = optuna.create_study(
+    direction="minimize",
+    sampler=optuna.samplers.TPESampler(seed=42),
+    pruner=optuna.pruners.MedianPruner(
+        n_startup_trials=5,   # 最初は prune しない
+        n_warmup_steps=50     # 最低 50 epoch は見る
+    )
+)
+N_TRIALS_INITIAL = 100
+study_ann.optimize(lambda trial: objective_ann(trial, prepared_data),
+                   n_trials=N_TRIALS_INITIAL,
+                   show_progress_bar=True)
+best_trial = study_ann.best_trial
+print("best epoch:", best_trial.last_step)
+
+# --- best_params_initial と final_lr の取得 ---
+best_params_initial = study_ann.best_params
+final_lr_initial = best_params_initial['learning_rate']
+
+print("\n--- Optuna 最適化結果 (初期) ---")
+print(f"ベスト検証RMSE (元のスケール): {study_ann.best_value:.4f}")
+print("ベストトライアルのハイパーパラメータ:")
+print(best_params_initial)
+
+
+
+# ===== 最初の訓練・評価（PI計算のために必須) =====
+epochs_final = 250 # 最終的な学習エポック数
+
+print(f"\n--- 最初の最終訓練を実行 (PI計算および反復関数への引渡しのため) ---")
+y_true_initial, y_pred_initial, final_model_initial = final_train_and_evaluate(
+    prepared_data,
+    best_params_initial,
+    epochs_final,
+    final_lr_initial
+)
+
+
+# ===== 反復的な特徴量選択とHPOの実行 =====
+print("\n======================  反復的な最適化とフィルタリングを開始  ======================")
+# 統合関数を実行
+final_features, final_model_iterative, (y_true_final, y_pred_final) = iterative_feature_selection_and_hpo_integrated_optimized(
+    data_bert_reduced=data_bert_reduced,
+    prepared_data_initial=prepared_data,       # 初期データ準備の結果
+    best_params_initial=best_params_initial,   # 初期Optunaの結果
+    epochs_final=epochs_final,
+    final_lr=final_lr_initial,                 # 初期の学習率
+    max_iterations=5,
+    pi_repeats=20,
+    n_trials_hpo=50  # 反復中のOptuna試行回数
+)
+
+print("\n--- 最終的な最適化とフィルタリング結果 ---")
+print(f"最終特徴量リスト ({len(final_features)} 個): {final_features}")
+
+
+
+# ===== アップリフト分析 (最終モデルと最終結果を使用) =====
+# 最終データセットを準備（アップリフト分析用）
+prepared_data_final = prepare_data_for_ann_filtered(
+    data_bert_reduced.copy(),
+    target_col='売上数',
+    features_to_drop=[f for f in prepared_data['feature_names'] if f not in final_features]
+)
+
+# --- 最終PI計算 (アップリフト分析の前に) ---
+pi_result_df_final = feature_importance_analysis_robust(
+    model=final_model_iterative,
+    prepared_data=prepared_data_final,
+    y_true=y_true_final,
+    y_pred=y_pred_final,
+    n_repeats=10
+)
+N_TOP_FEATURES = 20
+top_pi_features = pi_result_df_final['Feature'].head(N_TOP_FEATURES).tolist()
 
 # Uplift Visualizationの実行
-# Individual Uplift Score の計算 (S-Learner)
-M_C, M_T, individual_uplift = calculate_individual_uplift(model, prepared_data)
-# Uplift Visualizationの実行 (Individual Uplift スコアを使用)
+print("\n---  Uplift Analysisを開始 ---")
+M_C, M_T, individual_uplift = calculate_individual_uplift(final_model_iterative, prepared_data_final)
+
 if M_C is not None:
     uplift_visualization(M_C, individual_uplift)
-    # 動的なPI上位特徴量を使って分析関数の実行
+
     df_comparison_result, df_counts = analyze_uplift_segments(
         M_C,
         individual_uplift,
-        prepared_data,
+        prepared_data_final,  # 最終データセットを使用
         top_pi_features=top_pi_features,
         uplift_threshold=0.0,
-        # mc_threshold=120.0
     )
-    # print(f"\n--- セグメント別 サンプル数 ---")
-    # print(df_counts.to_markdown(index=False))
-    print(f"\n--- 主要な特徴量のセグメント別比較 ---")
+
+    print(f"\n--- 主要な特徴量のセグメント別比較 (最終フィルタリング後) ---")
     print(df_comparison_result.to_markdown(index=False))
+
+
+if 'pi_result_df_final' in locals() and 'data_bert' in locals():
+    # 'data_bert' は元の768次元のbert_vecを持つデータフレームを指す必要があります。
+    # 最終的なPI結果と元のデータフレーム (name, bert_vecを持つ) を渡す。
+    analyze_top_bert_features_automatically(
+        pi_result_df=pi_result_df_final,
+        full_data_df=data_bert, # analyze_bert_dimensionは元の 'bert_vec' が必要
+        n_top=2
+    )
+else:
+    print("\n[警告] analyze_top_bert_features_automaticallyを実行できませんでした。pi_result_df_final または data_bert が定義されていません。")
