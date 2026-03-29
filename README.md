@@ -33,9 +33,9 @@
 - RMSE: 43.14 → 16.87（約60%改善）
 - 広告効果は約3週間後に最大化（lag3）
 - 需要予測モデルの特徴量重要度
-Permutation Importance（Robust）による分析の結果、在庫関連の指標に加え、BERTによりベクトル化した商品名情報（bert_reduced）や、在庫と広告の相互作用項（Interaction）が予測に寄与していることが分かりました。（特徴量重要度グラフ：`./image/permutation_importance.png`）
+Permutation Importance（Robust）による分析の結果、在庫関連の指標に加え、BERTによりベクトル化した商品名情報（bert_reduced）や、在庫と広告の相互作用項（Interaction）が予測に寄与していることが分かりました。（特徴量重要度グラフ：![Slide Preview](./image/permutation_importance.png)）
 - 広告効果のUplift分析（4象限分類）
-- 予測売上（広告なしの場合）を横軸、Individual Uplift Scoreを縦軸に取り、対象を4象限に分類しました。これにより、広告によって売上が最大化しやすい「Persuadables（説得可能層）」を特定できました。（Uplift 4象限プロット：`./image/uplift_4quadrant.png`）
+- 予測売上（広告なしの場合）を横軸、Individual Uplift Scoreを縦軸に取り、対象を4象限に分類しました。これにより、広告によって売上が最大化しやすい「Persuadables（説得可能層）」を特定できました。（Uplift 4象限プロット：![Slide Preview](./image/uplift_4quadrant.png)）
 
 ## 工夫した点
 - テキストデータ（商品名）を活用した特徴量設計
